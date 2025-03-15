@@ -80,15 +80,23 @@ def visualize_spectrograms(noisy_mel, mask, sr=16000, hop_length=256, output_pat
         noisy_mel = noisy_mel.detach().cpu().numpy()
     if isinstance(mask, torch.Tensor):
         mask = mask.detach().cpu().numpy()
-    noisy_mel = np.squeeze(noisy_mel)
-    mask = np.squeeze(mask)
+
+    # Ensure we have 2D arrays
+    if noisy_mel.ndim == 3:
+        noisy_mel = np.squeeze(noisy_mel, axis=0)
+    if mask.ndim == 3:
+        mask = np.squeeze(mask, axis=0)
+
+    # Ensure both arrays have the same shape
+    if noisy_mel.shape != mask.shape:
+        raise ValueError(f"Shape mismatch: noisy_mel shape {noisy_mel.shape} != mask shape {mask.shape}")
 
     # Convert mel to dB scale
     mel_db = librosa.power_to_db(noisy_mel, ref=np.max)
 
     # Calculate time and frequency axes
-    times = np.arange(mask.shape[1]) * hop_length / sr
-    freqs = np.arange(mask.shape[0])
+    times = np.arange(noisy_mel.shape[1]) * hop_length / sr
+    freqs = np.arange(noisy_mel.shape[0])
 
     # Create figure with three subplots
     fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 10))
