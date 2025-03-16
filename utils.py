@@ -64,16 +64,9 @@ def mel_to_audio(mel_spec, sr=16000, n_fft=1024, hop_length=256):
         return np.zeros(sr)
 
 
-def visualize_spectrograms(noisy_mel, mask, sr=16000, hop_length=256, output_path=None):
+def visualize_spectrograms(noisy_mel, mask, sr=16000, hop_length=256, output_path=None, ax=None, title=None):
     """
-    Visualize mel spectrogram and noise mask. Save to file if output_path is provided, otherwise display.
-
-    Args:
-        noisy_mel: Mel spectrogram
-        mask: Binary noise mask
-        sr: Sample rate
-        hop_length: Hop length for spectrogram
-        output_path: Optional path to save the output image. If None, display instead.
+    Visualize mel spectrogram and noise mask.
     """
     # Convert tensors to numpy and remove batch dimension
     if isinstance(noisy_mel, torch.Tensor):
@@ -87,77 +80,46 @@ def visualize_spectrograms(noisy_mel, mask, sr=16000, hop_length=256, output_pat
     if mask.ndim == 3:
         mask = np.squeeze(mask, axis=0)
 
-    # Ensure both arrays have the same shape
-    if noisy_mel.shape != mask.shape:
-        raise ValueError(f"Shape mismatch: noisy_mel shape {noisy_mel.shape} != mask shape {mask.shape}")
-
-    # Convert mel to dB scale
-    mel_db = librosa.power_to_db(noisy_mel, ref=np.max)
-
     # Calculate time and frequency axes
     times = np.arange(noisy_mel.shape[1]) * hop_length / sr
     freqs = np.arange(noisy_mel.shape[0])
 
-    # Create figure with three subplots
-    fig, (ax1, ax2, ax3) = plt.subplots(3, 1, figsize=(15, 10))
+    if ax is None:
+        fig, (ax1, ax2) = plt.subplots(2, 1, figsize=(10, 10))
+    else:
+        ax1, ax2 = ax
 
-    # Plot original mel spectrogram
-    img1 = librosa.display.specshow(
-        mel_db,
-        y_axis='mel',
-        x_axis='time',
-        sr=sr,
-        hop_length=hop_length,
-        ax=ax1,
-        cmap='viridis'
+    # Plot noisy mel spectrogram
+    img1 = ax1.imshow(
+        noisy_mel,
+        aspect='auto',
+        origin='lower',
+        cmap='viridis',
+        extent=[times[0], times[-1], freqs[0], freqs[-1]]
     )
-    ax1.set_title('Noisy Mel Spectrogram')
-    fig.colorbar(img1, ax=ax1, format='%+2.0f dB')
+    ax1.set_title('Noisy Mel Spectrogram' if title is None else f'{title} - Mel')
+    ax1.set_ylabel('Mel Frequency')
+    plt.colorbar(img1, ax=ax1)
 
-    # Plot binary mask with clear colors
+    # Plot mask
     img2 = ax2.imshow(
         mask,
         aspect='auto',
         origin='lower',
-        cmap='RdYlBu_r',  # Red for noise (1), Blue for clean (0)
+        cmap='RdYlBu_r',
         vmin=0,
         vmax=1,
         extent=[times[0], times[-1], freqs[0], freqs[-1]]
     )
-    ax2.set_title('Noise Mask (Red: Noise, Blue: Clean)')
-    fig.colorbar(img2, ax=ax2)
-
-    # Plot overlay of mask on mel spectrogram
-    masked_mel = mel_db.copy()
-    masked_mel[mask > 0.5] = np.min(mel_db)  # Highlight noisy regions
-    img3 = librosa.display.specshow(
-        masked_mel,
-        y_axis='mel',
-        x_axis='time',
-        sr=sr,
-        hop_length=hop_length,
-        ax=ax3,
-        cmap='viridis'
-    )
-    ax3.set_title('Mel Spectrogram with Noise Regions Highlighted')
-    fig.colorbar(img3, ax=ax3, format='%+2.0f dB')
-
-    # Add time markers and mel frequency labels
-    for ax in [ax1, ax2, ax3]:
-        ax.set_xlabel('Time (s)')
-        ax.set_ylabel('Mel Frequency')
-
-    plt.tight_layout()
+    ax2.set_title('Noise Mask' if title is None else f'{title} - Mask')
+    ax2.set_xlabel('Time (s)')
+    ax2.set_ylabel('Mel Frequency')
+    plt.colorbar(img2, ax=ax2)
 
     if output_path:
         plt.savefig(output_path, dpi=300, bbox_inches='tight')
         plt.close()
-        print(f"Spectrograms saved to: {output_path}")
-    else:
-        plt.show()
 
-    noise_percentage = (mask > 0.5).mean() * 100
-    print(f"\nNoise Statistics:")
-    print(f"Percentage of regions with noise: {noise_percentage:.1f}%")
+    return (ax1, ax2)
 
 

@@ -8,31 +8,20 @@ from tqdm import tqdm
 from dataset import MUSANDataset
 import math
 import os
+from datetime import datetime
+from utils import visualize_spectrograms
+from matplotlib import pyplot as plt
+import librosa
 
 # Hyperparameters
-BATCH_SIZE = 16  # Smaller batch size
-EPOCHS = 10
-LEARNING_RATE = 0.0001  # Reduced learning rate
+BATCH_SIZE = 32
+EPOCHS = 12
+LEARNING_RATE = 0.0005
+HIDDEN_SIZE = 256
+NUM_LAYERS = 2
+NUM_WORKERS = 4
+MAX_FRAMES = 187  # Updated max_frames
 
-# Load dataset
-dataset = MUSANDataset(musan_dir="D:/Backup/musan")
-print(f"Total dataset size: {len(dataset)}")
-
-# Ensure dataset is not empty
-if len(dataset) == 0:
-    raise ValueError("Dataset is empty. Check musan_dir path and dataset files.")
-
-# Split dataset
-train_size = int(0.6 * len(dataset))
-val_size = int(0.2 * len(dataset))
-test_size = len(dataset) - train_size - val_size
-
-# Ensure train/val/test sizes are valid
-if train_size == 0 or val_size == 0 or test_size == 0:
-    raise ValueError("One of the dataset splits is zero. Consider increasing dataset size.")
-
-print(f"Train: {train_size}, Val: {val_size}, Test: {test_size}")
-train_set, val_set, test_set = torch.utils.data.random_split(dataset, [train_size, val_size, test_size])
 
 def collate_fn(batch):
     noisy_mels, mask, info = zip(*batch)
@@ -40,13 +29,10 @@ def collate_fn(batch):
     mask = torch.stack(mask)
     return noisy_mels, mask, info
 
-train_loader = data.DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-val_loader = data.DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-test_loader = data.DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
 
 # Define CNN + LSTM Model
 class CNN_LSTM(nn.Module):
-    def __init__(self, n_mels=128, hidden_size=128, num_layers=2, max_frames=186):
+    def __init__(self, n_mels=128, hidden_size=128, num_layers=2, max_frames=187):  # Updated max_frames
         super(CNN_LSTM, self).__init__()
 
         self.max_frames = max_frames
@@ -69,15 +55,17 @@ class CNN_LSTM(nn.Module):
 
         self.lstm = nn.LSTM(input_size=(n_mels//4)*32, hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
         self.fc = nn.Linear(hidden_size, n_mels)
-        self.upsample = nn.Upsample(size=(n_mels, max_frames), mode='bilinear', align_corners=False)
-        self.final_activation = nn.Sigmoid()  # Thêm sigmoid để normalize output về [0,1]
+        # Match input size exactly in upsampling
+        self.upsample = nn.Upsample(size=(n_mels, self.max_frames), mode='bilinear', align_corners=False)
+        self.final_activation = nn.Sigmoid()
 
     def forward(self, x):
         batch_size = x.size(0)
+        current_frames = x.size(3)
 
         # Ensure input has correct time dimension
-        if x.size(3) != self.max_frames:
-            x = nn.functional.pad(x, (0, self.max_frames - x.size(3), 0, 0), mode='constant', value=0)
+        if current_frames != self.max_frames:
+            x = nn.functional.pad(x, (0, self.max_frames - current_frames, 0, 0), mode='constant', value=0)
 
         x = self.cnn(x)  # [batch, 32, n_mels/4, time_frames/4]
         x = x.permute(0, 3, 1, 2).contiguous()  # [batch, time_frames/4, 32, n_mels/4]
@@ -93,150 +81,230 @@ class CNN_LSTM(nn.Module):
 
         return x
 
-# Initialize model, loss, optimizer
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = CNN_LSTM().to(device)
-criterion = nn.BCELoss()  # Use BCE loss thay vì MSE vì đã normalize data về [0,1]
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+class HybridLoss(nn.Module):
+    def __init__(self, alpha=0.7):  # Increase weight of BCE loss
+        super(HybridLoss, self).__init__()
+        self.alpha = alpha
+        self.bce = nn.BCELoss()
+        self.mse = nn.MSELoss()
 
-def train_model():
-    # Set up MLflow experiment
-    mlflow.set_experiment("Audio_Noise_Detection")
+    def forward(self, outputs, targets):
+        # Add weight to reduce false positives
+        bce_loss = self.bce(outputs, targets)
 
-    with mlflow.start_run():
-        # Log hyperparameters
+        # Penalize over-prediction of noise more heavily
+        false_positive_weight = 2.0
+        false_positive_loss = torch.mean(outputs * (1 - targets)) * false_positive_weight
+
+        mse_loss = self.mse(outputs, targets)
+
+        loss = self.alpha * (bce_loss + false_positive_loss) + (1 - self.alpha) * mse_loss
+
+        return loss, {
+            'bce_loss': bce_loss.item(),
+            'mse_loss': mse_loss.item(),
+            'fp_loss': false_positive_loss.item()
+        }
+
+
+def train_model(model, train_loader, val_loader):
+    timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
+    experiment_name = "noise_detection"
+    mlflow.set_experiment(experiment_name)
+
+    best_val_loss = float('inf')
+
+    # Lists to store metrics history
+    train_history = {
+        'loss': [],
+        'bce_loss': [],
+        'mse_loss': []
+    }
+    val_history = {
+        'loss': [],
+        'bce_loss': [],
+        'mse_loss': []
+    }
+
+    with mlflow.start_run(run_name=timestamp):
         mlflow.log_params({
             "batch_size": BATCH_SIZE,
             "epochs": EPOCHS,
             "learning_rate": LEARNING_RATE,
             "model_type": "CNN_LSTM",
-            "hidden_size": 128,
-            "num_layers": 2
+            "hidden_size": HIDDEN_SIZE,
+            "num_layers": NUM_LAYERS
         })
 
-        best_val_loss = float('inf')
+        try:
+            for epoch in range(EPOCHS):
+                # Training phase
+                model.train()
+                train_progress = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+                train_losses = []
+                train_bce_losses = []
+                train_mse_losses = []
 
-        for epoch in range(EPOCHS):
-            # Training phase
-            model.train()
-            total_loss = 0
+                for noisy_mel, mask_mel, _ in train_progress:
+                    noisy_mel = noisy_mel.to(device, non_blocking=True)
+                    mask_mel = mask_mel.to(device, non_blocking=True)
 
-            # Use tqdm for progress tracking
-            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
-
-            for batch_idx, (noisy_mel, mask_mel, info) in enumerate(progress_bar):
-                noisy_mel, mask_mel = noisy_mel.to(device), mask_mel.to(device)
-
-                # Forward pass
-                optimizer.zero_grad()
-                outputs = model(noisy_mel)
-
-                # Calculate loss
-                loss = criterion(outputs, mask_mel)
-
-                # Backward pass
-                loss.backward()
-
-                # Add gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-                optimizer.step()
-
-                # Update metrics
-                total_loss += loss.item()
-                current_loss = total_loss / (batch_idx + 1)
-
-                # Update progress bar
-                progress_bar.set_postfix({
-                    'loss': f'{current_loss:.4f}',
-                })
-
-            # Validation phase
-            model.eval()
-            val_loss = 0
-            val_accuracy = 0
-            total_samples = 0
-
-            with torch.no_grad():
-                for noisy_mel, mask_mel, _ in val_loader:
-                    noisy_mel, mask_mel = noisy_mel.to(device), mask_mel.to(device)
+                    optimizer.zero_grad(set_to_none=True)
                     outputs = model(noisy_mel)
-                    val_loss += criterion(outputs, mask_mel).item()
+                    loss, loss_components = criterion(outputs, mask_mel)
+                    loss.backward()
 
-                    # Calculate accuracy (threshold = 0.5)
-                    predicted = (outputs > 0.5).float()
-                    val_accuracy += (predicted == mask_mel).float().mean().item()
-                    total_samples += 1
+                    torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                    optimizer.step()
 
-            # Calculate average metrics
-            avg_train_loss = total_loss / len(train_loader)
-            avg_val_loss = val_loss / len(val_loader)
-            avg_val_accuracy = val_accuracy / total_samples
+                    train_losses.append(loss.item())
+                    train_bce_losses.append(loss_components["bce_loss"])
+                    train_mse_losses.append(loss_components["mse_loss"])
 
-            # Log metrics to MLflow
-            mlflow.log_metrics({
-                "train_loss": avg_train_loss,
-                "val_loss": avg_val_loss,
-                "val_accuracy": avg_val_accuracy
-            }, step=epoch)
+                    train_progress.set_postfix({
+                        'loss': f'{loss.item():.4f}',
+                        'bce': f'{loss_components["bce_loss"]:.4f}',
+                        'mse': f'{loss_components["mse_loss"]:.4f}'
+                    })
 
-            print(f"\nEpoch {epoch+1}/{EPOCHS}")
-            print(f"Train Loss: {avg_train_loss:.4f}")
-            print(f"Val Loss: {avg_val_loss:.4f}")
-            print(f"Val Accuracy: {avg_val_accuracy:.4f}")
+                # Calculate and store average losses for this epoch
+                avg_loss = sum(train_losses) / len(train_losses)
+                avg_bce = sum(train_bce_losses) / len(train_bce_losses)
+                avg_mse = sum(train_mse_losses) / len(train_mse_losses)
 
-        # Save best model
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_loss': best_val_loss,
-        }, "models/best_model.pth")
-        print("Saved new best model!")
+                train_history['loss'].append(avg_loss)
+                train_history['bce_loss'].append(avg_bce)
+                train_history['mse_loss'].append(avg_mse)
 
-        # Log final model to MLflow
-        mlflow.pytorch.log_model(model, "final_model")
-        print("Training complete!")
+                print(f"Epoch {epoch+1}/{EPOCHS} - Loss: {avg_loss:.4f}")
+                mlflow.log_metric("loss", avg_loss, step=epoch+1)
+
+                # Validation phase
+                model.eval()
+                val_losses = []
+                val_bce_losses = []
+                val_mse_losses = []
+                with torch.no_grad():
+                    for noisy_mel, mask_mel, _ in val_loader:
+                        noisy_mel = noisy_mel.to(device)
+                        mask_mel = mask_mel.to(device)
+
+                        outputs = model(noisy_mel)
+                        loss, loss_components = criterion(outputs, mask_mel)
+                        val_losses.append(loss.item())
+                        val_bce_losses.append(loss_components["bce_loss"])
+                        val_mse_losses.append(loss_components["mse_loss"])
+
+                avg_val_loss = sum(val_losses) / len(val_losses)
+                avg_val_bce = sum(val_bce_losses) / len(val_bce_losses)
+                avg_val_mse = sum(val_mse_losses) / len(val_mse_losses)
+
+                val_history['loss'].append(avg_val_loss)
+                val_history['bce_loss'].append(avg_val_bce)
+                val_history['mse_loss'].append(avg_val_mse)
+
+                print(f"Validation Loss: {avg_val_loss:.4f}")
+                mlflow.log_metric("val_loss", avg_val_loss, step=epoch+1)
+
+                # Save model artifact in MLflow
+                model_path = f"models/model_epoch_{epoch+1}.pth"
+                torch.save(model.state_dict(), model_path)
+                mlflow.log_artifact(model_path, artifact_path="models")
+
+                # Save best model separately
+                if avg_val_loss < best_val_loss:
+                    best_val_loss = avg_val_loss
+                    best_model_path = "models/best_model.pth"
+                    torch.save(model.state_dict(), best_model_path)
+                    mlflow.log_artifact(best_model_path, artifact_path="best_model")
+
+                # Log model architecture and hyperparameters
+                mlflow.pytorch.log_model(
+                    model,
+                    f"model_epoch_{epoch+1}",
+                    registered_model_name=f"noise_detection_model"
+                )
+
+        except KeyboardInterrupt:
+            print("Training interrupted by user")
+        except Exception as e:
+            print(f"Error during training: {str(e)}")
+
+        # Plot training history
+        epochs = range(1, len(train_history['loss']) + 1)
+
+        plt.figure(figsize=(10, 6))
+
+        # Plot all losses on same figure
+        plt.plot(epochs, train_history['loss'], 'b-', label='Train Total Loss')
+        plt.plot(epochs, val_history['loss'], 'b--', label='Val Total Loss')
+        plt.plot(epochs, train_history['bce_loss'], 'r-', label='Train BCE Loss')
+        plt.plot(epochs, val_history['bce_loss'], 'r--', label='Val BCE Loss')
+        plt.plot(epochs, train_history['mse_loss'], 'g-', label='Train MSE Loss')
+        plt.plot(epochs, val_history['mse_loss'], 'g--', label='Val MSE Loss')
+
+        plt.title('Training and Validation Losses')
+        plt.xlabel('Epoch')
+        plt.ylabel('Loss')
+        plt.legend()
+        plt.grid(True)
+
+        # Save plot
+        os.makedirs("training_results", exist_ok=True)
+        plt.savefig('training_results/loss_history.png')
+        plt.close()
+
 
 # Run training
 if __name__ == "__main__":
+    # Initialize model, loss, optimizer
+    device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+    print(f"Using device: {device}")
+
+    # Load dataset
+    dataset = MUSANDataset(preprocessed_dir="./preprocessed_dataset")
+    print()
+
+
+    # Split dataset with 60:20:20 ratio
+    train_size = int(0.6 * len(dataset))
+    val_size = int(0.2 * len(dataset))
+    test_size = len(dataset) - train_size - val_size
+
+    train_set, val_set, test_set = torch.utils.data.random_split(
+        dataset,
+        [train_size, val_size, test_size]
+    )
+
+    print(
+        f"Total dataset: {len(dataset)},",
+        f"Train set: {len(train_set)},",
+        f"Validation set: {len(val_set)},",
+        f"Test set: {len(test_set)}"
+    )
+
+    # Create data loaders
+    train_loader = data.DataLoader(
+        train_set,
+        batch_size=BATCH_SIZE,
+        shuffle=True,
+        num_workers=NUM_WORKERS,
+        collate_fn=collate_fn
+    )
+
+    val_loader = data.DataLoader(
+        val_set,
+        batch_size=BATCH_SIZE,
+        shuffle=False,
+        num_workers=NUM_WORKERS,
+        collate_fn=collate_fn
+    )
+
+    model = CNN_LSTM(hidden_size=HIDDEN_SIZE, num_layers=NUM_LAYERS, max_frames=MAX_FRAMES).to(device)
+    criterion = HybridLoss(alpha=0.7)
+    optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE)
+
     # Create models directory if it doesn't exist
     os.makedirs("models", exist_ok=True)
-    train_model()
-
-# Load Model
-def load_and_evaluate():
-    try:
-        checkpoint = torch.load("models/250316_cnn_lstm_loss_0.113_acc_0.9383.pth", map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-
-        test_loss = 0
-        test_accuracy = 0
-        total_samples = 0
-
-        with torch.no_grad():
-            for noisy_mel, mask_mel, _ in tqdm(test_loader, desc="Evaluating"):
-                noisy_mel, mask_mel = noisy_mel.to(device), mask_mel.to(device)
-                outputs = model(noisy_mel)
-                test_loss += criterion(outputs, mask_mel).item()
-
-                # Calculate accuracy
-                predicted = (outputs > 0.5).float()
-                test_accuracy += (predicted == mask_mel).float().mean().item()
-                total_samples += 1
-
-        avg_test_loss = test_loss / len(test_loader)
-        avg_test_accuracy = test_accuracy / total_samples
-
-        print(f"Test Loss: {avg_test_loss:.4f}")
-        print(f"Test Accuracy: {avg_test_accuracy:.4f}")
-
-        return avg_test_loss, avg_test_accuracy
-
-    except Exception as e:
-        print(f"Error loading or evaluating model: {str(e)}")
-        return None, None
-
-# Evaluate model
-load_and_evaluate()
+    train_model(model, train_loader, val_loader)  # Pass val_loader
+    print("Training complete!")

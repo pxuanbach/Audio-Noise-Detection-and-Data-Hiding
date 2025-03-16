@@ -13,7 +13,7 @@ def save_and_play_audio(waveform, sr=16000, filename="output.wav"):
 
 # Load dataset
 musan_dir = "D:\Backup\musan"
-dataset = MUSANDataset(musan_dir, max_duration=5)
+dataset = MUSANDataset(musan_dir, max_duration=5, noise_ratio=0.3)
 
 # Get one sample with info
 idx = random.randint(0, len(dataset) - 1)
