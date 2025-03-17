@@ -13,10 +13,14 @@ import librosa
 from utils import visualize_spectrograms
 
 # Hyperparameters
-BATCH_SIZE = 32
-HIDDEN_SIZE = 256
-NUM_LAYERS = 2
-MAX_FRAMES = 187
+# BATCH_SIZE = 32
+# HIDDEN_SIZE = 256
+# NUM_LAYERS = 2
+MAX_FRAMES = 312
+
+BATCH_SIZE = 64  # Increased from 32
+HIDDEN_SIZE = 512  # Increased from 256
+NUM_LAYERS = 3  # Increased from 2
 
 
 def collate_fn(batch):
@@ -86,7 +90,7 @@ def validate_model():
     device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
 
     # Load dataset
-    dataset = MUSANDataset("./preprocessed_dataset")
+    dataset = MUSANDataset("./preprocessed_dataset2")
 
     # Split dataset with 60:20:20 ratio
     train_size = int(0.6 * len(dataset))
@@ -173,7 +177,7 @@ def validate_model():
 
     # Visualize random samples
     print("\nVisualizing random samples...")
-    visualize_random_samples(model, val_loader, device)
+    visualize_random_samples(model, val_loader, device, 10)
 
 if __name__ == "__main__":
     validate_model()

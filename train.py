@@ -14,13 +14,13 @@ from matplotlib import pyplot as plt
 import librosa
 
 # Hyperparameters
-BATCH_SIZE = 32
-EPOCHS = 12
-LEARNING_RATE = 0.0005
-HIDDEN_SIZE = 256
-NUM_LAYERS = 2
+BATCH_SIZE = 64  # Increased from 32
+EPOCHS = 50  # Increased from 12
+LEARNING_RATE = 0.0001  # Reduced from 0.0005
+HIDDEN_SIZE = 512  # Increased from 256
+NUM_LAYERS = 3  # Increased from 2
 NUM_WORKERS = 4
-MAX_FRAMES = 187  # Updated max_frames
+MAX_FRAMES = 312  # Updated max_frames
 
 
 def collate_fn(batch):
@@ -36,16 +36,19 @@ class CNN_LSTM(nn.Module):
         super(CNN_LSTM, self).__init__()
 
         self.max_frames = max_frames
+        self.dropout = nn.Dropout(0.3)  # Added dropout
 
-        # Add batch normalization to CNN layers
+        # Enhanced CNN layers
         self.cnn = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
+            nn.Conv2d(1, 32, kernel_size=3, stride=1, padding=1),  # Increased filters
             nn.BatchNorm2d(32),
             nn.ReLU(),
+            nn.Dropout2d(0.2),  # Added dropout
+            nn.MaxPool2d(kernel_size=2, stride=2),
+            nn.Conv2d(32, 64, kernel_size=3, stride=1, padding=1),  # Increased filters
+            nn.BatchNorm2d(64),
+            nn.ReLU(),
+            nn.Dropout2d(0.2),  # Added dropout
             nn.MaxPool2d(kernel_size=2, stride=2)
         )
 
@@ -53,7 +56,13 @@ class CNN_LSTM(nn.Module):
         self.n_mels_conv = n_mels // 4
         self.time_dim_conv = max_frames // 4
 
-        self.lstm = nn.LSTM(input_size=(n_mels//4)*32, hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
+        self.lstm = nn.LSTM(
+            input_size=(n_mels//4)*64,  # Updated for new CNN output
+            hidden_size=hidden_size,
+            num_layers=num_layers,
+            batch_first=True,
+            dropout=0.3 if num_layers > 1 else 0  # Added LSTM dropout
+        )
         self.fc = nn.Linear(hidden_size, n_mels)
         # Match input size exactly in upsampling
         self.upsample = nn.Upsample(size=(n_mels, self.max_frames), mode='bilinear', align_corners=False)
@@ -71,7 +80,9 @@ class CNN_LSTM(nn.Module):
         x = x.permute(0, 3, 1, 2).contiguous()  # [batch, time_frames/4, 32, n_mels/4]
         x = x.view(batch_size, self.time_dim_conv, -1)  # [batch, time_frames/4, feature_size]
 
+        x = self.dropout(x)  # Add dropout before LSTM
         x, _ = self.lstm(x)
+        x = self.dropout(x)  # Add dropout before FC
         x = self.fc(x)  # [batch, time_frames/4, n_mels]
 
         # Reshape and upsample to match target dimensions
@@ -82,7 +93,7 @@ class CNN_LSTM(nn.Module):
         return x
 
 class HybridLoss(nn.Module):
-    def __init__(self, alpha=0.7):  # Increase weight of BCE loss
+    def __init__(self, alpha=0.8):  # Increased BCE weight
         super(HybridLoss, self).__init__()
         self.alpha = alpha
         self.bce = nn.BCELoss()
@@ -107,7 +118,7 @@ class HybridLoss(nn.Module):
         }
 
 
-def train_model(model, train_loader, val_loader):
+def train_model(model, train_loader, val_loader, optimizer):
     timestamp = datetime.now().strftime("%Y%m%d_%H%M%S")
     experiment_name = "noise_detection"
     mlflow.set_experiment(experiment_name)
@@ -135,6 +146,15 @@ def train_model(model, train_loader, val_loader):
             "hidden_size": HIDDEN_SIZE,
             "num_layers": NUM_LAYERS
         })
+
+        # Add learning rate scheduler
+        scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+            optimizer,
+            mode='min',
+            factor=0.5,
+            patience=5,
+            verbose=True
+        )
 
         try:
             for epoch in range(EPOCHS):
@@ -206,6 +226,9 @@ def train_model(model, train_loader, val_loader):
                 print(f"Validation Loss: {avg_val_loss:.4f}")
                 mlflow.log_metric("val_loss", avg_val_loss, step=epoch+1)
 
+                # Update learning rate based on validation loss
+                scheduler.step(avg_val_loss)
+
                 # Save model artifact in MLflow
                 model_path = f"models/model_epoch_{epoch+1}.pth"
                 torch.save(model.state_dict(), model_path)
@@ -262,7 +285,7 @@ if __name__ == "__main__":
     print(f"Using device: {device}")
 
     # Load dataset
-    dataset = MUSANDataset(preprocessed_dir="./preprocessed_dataset")
+    dataset = MUSANDataset(preprocessed_dir="./preprocessed_dataset2")
     print()
 
 
@@ -306,5 +329,5 @@ if __name__ == "__main__":
 
     # Create models directory if it doesn't exist
     os.makedirs("models", exist_ok=True)
-    train_model(model, train_loader, val_loader)  # Pass val_loader
+    train_model(model, train_loader, val_loader, optimizer)  # Pass val_loader
     print("Training complete!")

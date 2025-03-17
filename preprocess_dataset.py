@@ -181,7 +181,9 @@ class DatasetPreprocessor:
 if __name__ == "__main__":
     preprocessor = DatasetPreprocessor(
         musan_dir="D:/Backup/musan",
-        output_dir="D:/Dev/Audio-Noise-Detection-and-Data-Hiding/preprocessed_dataset",
-        augment_factor=3
+        output_dir="./preprocessed_dataset2",
+        noise_ratio=0.3,
+        augment_factor=3,
+        max_duration=5,
     )
     preprocessor.preprocess_dataset()
