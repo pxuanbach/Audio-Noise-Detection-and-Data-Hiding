@@ -1,242 +1,193 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.utils.data as data
-import mlflow
+import torch.nn.functional as F
 import numpy as np
+import mlflow
 from tqdm import tqdm
-from dataset import MUSANDataset
-import math
+from numpy import genfromtxt
+from torch.utils.data import DataLoader, TensorDataset
+import matplotlib.pyplot as plt
+from datetime import datetime
 import os
+from preprocessing import N_FEATURES
 
-# Hyperparameters
-BATCH_SIZE = 16  # Smaller batch size
-EPOCHS = 10
-LEARNING_RATE = 0.0001  # Reduced learning rate
 
-# Load dataset
-dataset = MUSANDataset(musan_dir="D:/Backup/musan")
-print(f"Total dataset size: {len(dataset)}")
+#region HYPERPARAMETERS
 
-# Ensure dataset is not empty
-if len(dataset) == 0:
-    raise ValueError("Dataset is empty. Check musan_dir path and dataset files.")
+BATCH_SIZE = 50
+EPOCHS = 40
+LEARNING_RATE = 0.0002
+INPUT_CHANNELS = 5  # Changed from 1 to 5
+NUM_CLASSES = 10
+DEVICE = torch.device("cuda" if torch.cuda.is_available() else "cpu")
+DROPOUT_RATE = 0.3
+WEIGHT_DECAY = 2e-4  # Tăng L2 regularization
 
-# Split dataset
-train_size = int(0.6 * len(dataset))
-val_size = int(0.2 * len(dataset))
-test_size = len(dataset) - train_size - val_size
+#endregion
 
-# Ensure train/val/test sizes are valid
-if train_size == 0 or val_size == 0 or test_size == 0:
-    raise ValueError("One of the dataset splits is zero. Consider increasing dataset size.")
 
-print(f"Train: {train_size}, Val: {val_size}, Test: {test_size}")
-train_set, val_set, test_set = torch.utils.data.random_split(dataset, [train_size, val_size, test_size])
+#region DATA LOADING
+from datasets.audio_dataset import AudioDataset
 
-def collate_fn(batch):
-    noisy_mels, mask, info = zip(*batch)
-    noisy_mels = torch.stack(noisy_mels)
-    mask = torch.stack(mask)
-    return noisy_mels, mask, info
+x_train = genfromtxt('data/train_data.csv', delimiter=',')
+y_train = genfromtxt('data/train_labels.csv', delimiter=',')
+x_test = genfromtxt('data/test_data.csv', delimiter=',')
+y_test = genfromtxt('data/test_labels.csv', delimiter=',')
 
-train_loader = data.DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-val_loader = data.DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-test_loader = data.DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
+# One-hot encoding
+y_train = np.eye(NUM_CLASSES)[y_train.astype(int)]
+y_test = np.eye(NUM_CLASSES)[y_test.astype(int)]
 
-# Define CNN + LSTM Model
-class CNN_LSTM(nn.Module):
-    def __init__(self, n_mels=128, hidden_size=128, num_layers=2, max_frames=186):
-        super(CNN_LSTM, self).__init__()
+# Reshape data - swap dimensions to match model's expected input
+total_samples = x_train.shape[0]
+x_train = x_train.reshape(total_samples, INPUT_CHANNELS, N_FEATURES)  # [batch, channels, features]
+x_test = x_test.reshape(x_test.shape[0], INPUT_CHANNELS, N_FEATURES)
 
-        self.max_frames = max_frames
+# Create datasets with normalization
+train_dataset = AudioDataset(x_train, y_train, normalize=True, augment=True)  # Enable augmentation for training
+test_dataset = AudioDataset(x_test, y_test, normalize=True, augment=False)
 
-        # Add batch normalization to CNN layers
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)
-        )
+# Create dataloaders
+train_loader = DataLoader(train_dataset, batch_size=BATCH_SIZE, shuffle=True)
+test_loader = DataLoader(test_dataset, batch_size=BATCH_SIZE, shuffle=False)
 
-        # Calculate sizes after CNN
-        self.n_mels_conv = n_mels // 4
-        self.time_dim_conv = max_frames // 4
+#endregion
 
-        self.lstm = nn.LSTM(input_size=(n_mels//4)*32, hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, n_mels)
-        self.upsample = nn.Upsample(size=(n_mels, max_frames), mode='bilinear', align_corners=False)
-        self.final_activation = nn.Sigmoid()  # Thêm sigmoid để normalize output về [0,1]
 
-    def forward(self, x):
-        batch_size = x.size(0)
+#region MODEL
+from models.hybrid_model import HybridCNNAttention
 
-        # Ensure input has correct time dimension
-        if x.size(3) != self.max_frames:
-            x = nn.functional.pad(x, (0, self.max_frames - x.size(3), 0, 0), mode='constant', value=0)
+model = HybridCNNAttention(
+    input_channels=INPUT_CHANNELS,
+    num_classes=NUM_CLASSES,
+    dropout_rate=DROPOUT_RATE,
+).to(DEVICE)
 
-        x = self.cnn(x)  # [batch, 32, n_mels/4, time_frames/4]
-        x = x.permute(0, 3, 1, 2).contiguous()  # [batch, time_frames/4, 32, n_mels/4]
-        x = x.view(batch_size, self.time_dim_conv, -1)  # [batch, time_frames/4, feature_size]
+# Count trainable parameters
+def count_parameters(model):
+    return sum(p.numel() for p in model.parameters() if p.requires_grad)
 
-        x, _ = self.lstm(x)
-        x = self.fc(x)  # [batch, time_frames/4, n_mels]
+print(f'\nTrainable parameters: {count_parameters(model):,}\n')
+# print('Model architecture:')
+# print(model)
 
-        # Reshape and upsample to match target dimensions
-        x = x.permute(0, 2, 1).contiguous().unsqueeze(1)  # [batch, 1, n_mels, time_frames/4]
-        x = self.upsample(x)  # [batch, 1, n_mels, max_frames]
-        x = self.final_activation(x)  # Normalize output
+criterion = nn.CrossEntropyLoss()
+optimizer = optim.AdamW(model.parameters(), lr=LEARNING_RATE, weight_decay=WEIGHT_DECAY)
 
-        return x
+# Add learning rate scheduler
+scheduler = optim.lr_scheduler.ReduceLROnPlateau(
+    optimizer, mode='max', factor=0.5, patience=5
+)
 
-# Initialize model, loss, optimizer
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = CNN_LSTM().to(device)
-criterion = nn.BCELoss()  # Use BCE loss thay vì MSE vì đã normalize data về [0,1]
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+#endregion
 
-def train_model():
-    # Set up MLflow experiment
-    mlflow.set_experiment("Audio_Noise_Detection")
 
-    with mlflow.start_run():
-        # Log hyperparameters
-        mlflow.log_params({
-            "batch_size": BATCH_SIZE,
-            "epochs": EPOCHS,
-            "learning_rate": LEARNING_RATE,
-            "model_type": "CNN_LSTM",
-            "hidden_size": 128,
-            "num_layers": 2
-        })
+#region TRAINING
+# Create visualization directory with timestamp
+timestamp = datetime.now().strftime('%Y%m%d_%H%M%S')
+viz_dir = os.path.join('training_visualization', timestamp)
+os.makedirs(viz_dir, exist_ok=True)
 
-        best_val_loss = float('inf')
+# Lists to store metrics
+train_losses = []
+train_accuracies = []
+test_losses = []
+test_accuracies = []
 
-        for epoch in range(EPOCHS):
-            # Training phase
-            model.train()
-            total_loss = 0
+with mlflow.start_run():
+    mlflow.log_param("BATCH_SIZE", BATCH_SIZE)
+    mlflow.log_param("EPOCHS", EPOCHS)
+    mlflow.log_param("LEARNING_RATE", LEARNING_RATE)
+    mlflow.log_param("INPUT_CHANNELS", LEARNING_RATE)
+    mlflow.log_param("NUM_CLASSES", NUM_CLASSES)
+    mlflow.log_param("WEIGHT_DECAY", WEIGHT_DECAY)
+    mlflow.log_param("DEVICE", DEVICE.type)
 
-            # Use tqdm for progress tracking
-            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+    for epoch in range(EPOCHS):
+        model.train()
+        train_loss, correct = 0, 0
+        progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+        for batch_x, batch_y in progress_bar:
+            batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+            optimizer.zero_grad()
+            outputs = model(batch_x)
+            loss = criterion(outputs, batch_y)
+            loss.backward()
+            torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+            optimizer.step()
+            train_loss += loss.item()
+            correct += (outputs.argmax(1) == batch_y.argmax(1)).sum().item()
+            progress_bar.set_postfix(loss=loss.item())
 
-            for batch_idx, (noisy_mel, mask_mel, info) in enumerate(progress_bar):
-                noisy_mel, mask_mel = noisy_mel.to(device), mask_mel.to(device)
+        train_accuracy = correct / len(train_loader.dataset)
+        train_loss /= len(train_loader)
 
-                # Forward pass
-                optimizer.zero_grad()
-                outputs = model(noisy_mel)
-
-                # Calculate loss
-                loss = criterion(outputs, mask_mel)
-
-                # Backward pass
-                loss.backward()
-
-                # Add gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
-
-                optimizer.step()
-
-                # Update metrics
-                total_loss += loss.item()
-                current_loss = total_loss / (batch_idx + 1)
-
-                # Update progress bar
-                progress_bar.set_postfix({
-                    'loss': f'{current_loss:.4f}',
-                })
-
-            # Validation phase
-            model.eval()
-            val_loss = 0
-            val_accuracy = 0
-            total_samples = 0
-
-            with torch.no_grad():
-                for noisy_mel, mask_mel, _ in val_loader:
-                    noisy_mel, mask_mel = noisy_mel.to(device), mask_mel.to(device)
-                    outputs = model(noisy_mel)
-                    val_loss += criterion(outputs, mask_mel).item()
-
-                    # Calculate accuracy (threshold = 0.5)
-                    predicted = (outputs > 0.5).float()
-                    val_accuracy += (predicted == mask_mel).float().mean().item()
-                    total_samples += 1
-
-            # Calculate average metrics
-            avg_train_loss = total_loss / len(train_loader)
-            avg_val_loss = val_loss / len(val_loader)
-            avg_val_accuracy = val_accuracy / total_samples
-
-            # Log metrics to MLflow
-            mlflow.log_metrics({
-                "train_loss": avg_train_loss,
-                "val_loss": avg_val_loss,
-                "val_accuracy": avg_val_accuracy
-            }, step=epoch)
-
-            print(f"\nEpoch {epoch+1}/{EPOCHS}")
-            print(f"Train Loss: {avg_train_loss:.4f}")
-            print(f"Val Loss: {avg_val_loss:.4f}")
-            print(f"Val Accuracy: {avg_val_accuracy:.4f}")
-
-        # Save best model
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_loss': best_val_loss,
-        }, "models/best_model.pth")
-        print("Saved new best model!")
-
-        # Log final model to MLflow
-        mlflow.pytorch.log_model(model, "final_model")
-        print("Training complete!")
-
-# Run training
-if __name__ == "__main__":
-    # Create models directory if it doesn't exist
-    os.makedirs("models", exist_ok=True)
-    train_model()
-
-# Load Model
-def load_and_evaluate():
-    try:
-        checkpoint = torch.load("models/250316_cnn_lstm_loss_0.113_acc_0.9383.pth", map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
+        # Evaluate on test set every epoch
         model.eval()
-
-        test_loss = 0
-        test_accuracy = 0
-        total_samples = 0
-
+        test_loss, correct = 0, 0
         with torch.no_grad():
-            for noisy_mel, mask_mel, _ in tqdm(test_loader, desc="Evaluating"):
-                noisy_mel, mask_mel = noisy_mel.to(device), mask_mel.to(device)
-                outputs = model(noisy_mel)
-                test_loss += criterion(outputs, mask_mel).item()
+            for batch_x, batch_y in test_loader:
+                batch_x, batch_y = batch_x.to(DEVICE), batch_y.to(DEVICE)
+                outputs = model(batch_x)
+                loss = criterion(outputs, batch_y)
+                test_loss += loss.item()
+                correct += (outputs.argmax(1) == batch_y.argmax(1)).sum().item()
 
-                # Calculate accuracy
-                predicted = (outputs > 0.5).float()
-                test_accuracy += (predicted == mask_mel).float().mean().item()
-                total_samples += 1
+        test_accuracy = correct / len(test_loader.dataset)
+        test_loss /= len(test_loader)
 
-        avg_test_loss = test_loss / len(test_loader)
-        avg_test_accuracy = test_accuracy / total_samples
+        # Store metrics
+        train_losses.append(train_loss)
+        train_accuracies.append(train_accuracy)
+        test_losses.append(test_loss)
+        test_accuracies.append(test_accuracy)
 
-        print(f"Test Loss: {avg_test_loss:.4f}")
-        print(f"Test Accuracy: {avg_test_accuracy:.4f}")
+        # Logging to MLflow
+        mlflow.log_metric("train_loss", train_loss, step=epoch)
+        mlflow.log_metric("train_accuracy", train_accuracy, step=epoch)
+        mlflow.log_metric("test_loss", test_loss, step=epoch)
+        mlflow.log_metric("test_accuracy", test_accuracy, step=epoch)
 
-        return avg_test_loss, avg_test_accuracy
+        print(f'Epoch {epoch+1}/{EPOCHS}, Loss: {train_loss:.4f}, Accuracy: {train_accuracy:.4f}')
+        print(f'Test Loss: {test_loss:.4f}, Test Accuracy: {test_accuracy:.4f}')
 
-    except Exception as e:
-        print(f"Error loading or evaluating model: {str(e)}")
-        return None, None
+        # After each epoch
+        scheduler.step(train_accuracy)
 
-# Evaluate model
-load_and_evaluate()
+    # Save final plots
+    plt.figure(figsize=(12, 4))
+
+    plt.subplot(1, 2, 1)
+    plt.plot(train_losses, label='Train Loss')
+    plt.plot(test_losses, label='Test Loss')
+    plt.xlabel('Epoch')
+    plt.ylabel('Loss')
+    plt.legend()
+    plt.title('Final Training and Test Loss')
+
+    plt.subplot(1, 2, 2)
+    plt.plot(train_accuracies, label='Train Accuracy')
+    plt.plot(test_accuracies, label='Test Accuracy')
+    plt.xlabel('Epoch')
+    plt.ylabel('Accuracy')
+    plt.legend()
+    plt.title('Final Training and Test Accuracy')
+
+    plt.tight_layout()
+    plt.savefig(os.path.join(viz_dir, 'final_metrics.png'))
+    plt.close()
+
+    # Save metrics to CSV for future reference
+    np.savetxt(os.path.join(viz_dir, 'metrics.csv'),
+               np.column_stack([train_losses, train_accuracies, test_losses, test_accuracies]),
+               delimiter=',',
+               header='train_loss,train_acc,test_loss,test_acc',
+               comments='')
+
+    # Save model
+    torch.save(model.state_dict(), "models/model_unet_lstm.pth")
+    mlflow.log_artifact("models/model_unet_lstm.pth")
+    print("\nModel Saved.\n")
+
+#endregion

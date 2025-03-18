@@ -177,3 +177,5 @@ cython_debug/
 *.wav
 *.pth
 mlruns/
+urbansound8k/
+*.csv
