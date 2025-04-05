@@ -1,115 +1,111 @@
 import torch
-import librosa
+import torch.nn as nn
+from encoder import DenseEncoder
+from decoder import DenseDecoder
+import torchaudio
 import numpy as np
-from train import CNN_LSTM
 import os
 
-class NoiseDetector:
-    def __init__(self, model_path, sr=16000, n_mels=128, max_frames=186):
-        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
-        self.model = CNN_LSTM().to(self.device)
+def load_trained_models(model_path, data_depth=1, hidden_size=64, device='cuda'):
+    """Load trained encoder and decoder models"""
+    # Initialize models
+    encoder = DenseEncoder(data_depth, hidden_size).to(device)
+    decoder = DenseDecoder(data_depth, hidden_size).to(device)
 
-        # Load trained model
-        checkpoint = torch.load(model_path, map_location=self.device)
-        self.model.load_state_dict(checkpoint['model_state_dict'])
-        self.model.eval()
+    # Load checkpoint
+    checkpoint = torch.load(model_path, map_location=device)
+    encoder.load_state_dict(checkpoint['state_dict_encoder'])
+    decoder.load_state_dict(checkpoint['state_dict_decoder'])
 
-        # Audio processing parameters
-        self.sr = sr
-        self.n_mels = n_mels
-        self.max_frames = max_frames
-        self.n_fft = 1024
-        self.hop_length = 256
-        self.segment_duration = 0.5  # 500ms segments
+    # Set to eval mode
+    encoder.eval()
+    decoder.eval()
 
-    def process_audio(self, audio_path):
-        """
-        Process audio file and return time segments containing noise.
+    return encoder, decoder
 
-        Args:
-            audio_path (str): Path to audio file
+def hide_message(encoder, audio_path, message, output_path, device='cuda'):
+    """Hide a binary message in an audio file"""
+    # Load and preprocess audio
+    waveform, sample_rate = torchaudio.load(audio_path)
+    # Normalize to [-1, 1]
+    waveform = waveform / torch.max(torch.abs(waveform))
 
-        Returns:
-            list: List of tuples containing (start_time, end_time) of noisy segments
-            numpy.ndarray: Boolean array indicating noisy frames
-        """
-        # Load and process audio
-        audio, _ = librosa.load(audio_path, sr=self.sr)
+    # Reshape audio to 2D (like image)
+    audio_len = waveform.size(-1)
+    height = int(np.sqrt(audio_len))
+    width = int(np.ceil(audio_len / height))
+    padding = height * width - audio_len
 
-        # Convert to mel spectrogram
-        mel_spec = librosa.feature.melspectrogram(
-            y=audio,
-            sr=self.sr,
-            n_mels=self.n_mels,
-            n_fft=self.n_fft,
-            hop_length=self.hop_length
-        )
-        mel_spec = librosa.power_to_db(mel_spec, ref=np.max)
+    # Pad if needed
+    if padding > 0:
+        waveform = torch.nn.functional.pad(waveform, (0, padding))
 
-        # Normalize to [0, 1]
-        mel_spec = (mel_spec - mel_spec.min()) / (mel_spec.max() - mel_spec.min() + 1e-6)
+    # Reshape to square
+    cover = waveform.reshape(1, 1, height, width)
 
-        # Process in windows if audio is too long
-        predictions = []
-        for i in range(0, mel_spec.shape[1], self.max_frames):
-            # Extract window
-            window = mel_spec[:, i:i + self.max_frames]
-            if window.shape[1] < self.max_frames:
-                window = np.pad(window, ((0, 0), (0, self.max_frames - window.shape[1])), mode='constant')
+    # Prepare message
+    payload = torch.tensor(message, device=device).float()
+    payload = payload.reshape(1, 1, height, width)
 
-            # Convert to tensor
-            window_tensor = torch.tensor(window, dtype=torch.float32).unsqueeze(0).unsqueeze(0)
-            window_tensor = window_tensor.to(self.device)
+    # Generate marked audio
+    with torch.no_grad():
+        cover = cover.to(device)
+        marked = encoder(cover, payload)
 
-            # Get model predictions
-            with torch.no_grad():
-                output = self.model(window_tensor)
-                pred = (output > 0.5).float().cpu().numpy().squeeze()
+    # Reshape back and save
+    marked = marked.cpu().reshape(-1)[:audio_len]
+    torchaudio.save(output_path, marked.unsqueeze(0), sample_rate)
 
-            # Only keep predictions for actual frames (not padding)
-            actual_frames = min(self.max_frames, mel_spec.shape[1] - i)
-            predictions.extend(pred[0, :actual_frames])
+    return marked
 
-        # Convert frame-level predictions to time segments
-        noisy_segments = []
-        frame_duration = self.hop_length / self.sr
-        is_noisy = False
-        start_time = 0
+def extract_message(decoder, audio_path, device='cuda'):
+    """Extract hidden message from marked audio"""
+    # Load marked audio
+    waveform, _ = torchaudio.load(audio_path)
 
-        predictions = np.array(predictions)
-        frame_indicators = predictions > 0.5
+    # Reshape to 2D
+    audio_len = waveform.size(-1)
+    height = int(np.sqrt(audio_len))
+    width = int(np.ceil(audio_len / height))
 
-        for i, is_noise in enumerate(frame_indicators):
-            if is_noise and not is_noisy:
-                start_time = i * frame_duration
-                is_noisy = True
-            elif not is_noise and is_noisy:
-                end_time = i * frame_duration
-                noisy_segments.append((start_time, end_time))
-                is_noisy = False
+    if height * width > audio_len:
+        waveform = torch.nn.functional.pad(waveform, (0, height * width - audio_len))
 
-        # Handle case where audio ends during noisy segment
-        if is_noisy:
-            end_time = len(frame_indicators) * frame_duration
-            noisy_segments.append((start_time, end_time))
+    marked = waveform.reshape(1, 1, height, width)
 
-        return noisy_segments, frame_indicators
+    # Extract message
+    with torch.no_grad():
+        marked = marked.to(device)
+        decoded = decoder(marked)
 
-def main():
+    # Convert to binary
+    message = (decoded >= 0.0).cpu().numpy().reshape(-1)[:audio_len]
+
+    return message
+
+if __name__ == '__main__':
+    # Config
+    device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+    model_path = 'results/model/your_best_model.dat'  # Change to your model path
+
+    # Load models
+    encoder, decoder = load_trained_models(model_path, device=device)
+
     # Example usage
-    detector = NoiseDetector(
-        model_path="models/250316_cnn_lstm_loss_0.113_acc_0.9383.pth"
-    )
+    audio_path = 'samples/test.wav'
+    output_path = 'samples/marked.wav'
 
-    audio_path = "output.wav"
-    noisy_segments, frame_indicators = detector.process_audio(audio_path)
+    # Create random message (for demo)
+    message = np.random.randint(0, 2, size=44100)  # 1 second of binary data
 
-    print("\nNoisy segments detected:")
-    for start, end in noisy_segments:
-        print(f"From {start:.2f}s to {end:.2f}s")
+    # Hide message
+    print("Hiding message in audio...")
+    marked_audio = hide_message(encoder, audio_path, message, output_path)
 
-    print(f"\nTotal frames: {len(frame_indicators)}")
-    print(f"Noisy frames: {np.sum(frame_indicators)}")
+    # Extract message
+    print("Extracting message from marked audio...")
+    extracted_message = extract_message(decoder, output_path)
 
-if __name__ == "__main__":
-    main()
+    # Calculate accuracy
+    accuracy = np.mean(message == extracted_message)
+    print(f"Message extraction accuracy: {accuracy:.2%}")

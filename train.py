@@ -1,242 +1,207 @@
 import torch
 import torch.nn as nn
 import torch.optim as optim
-import torch.utils.data as data
-import mlflow
-import numpy as np
+from torch.utils.data import DataLoader
 from tqdm import tqdm
-from dataset import MUSANDataset
-import math
-import os
+import logging
+import gc
+from pathlib import Path
+import numpy as np
 
-# Hyperparameters
-BATCH_SIZE = 16  # Smaller batch size
-EPOCHS = 10
-LEARNING_RATE = 0.0001  # Reduced learning rate
+from datasets.audio_dataset import AudioDataset
+from encoder import DenseEncoder
+from decoder import DenseDecoder
+from critic import BasicCritic
 
-# Load dataset
-dataset = MUSANDataset(musan_dir="D:/Backup/musan")
-print(f"Total dataset size: {len(dataset)}")
+# Setup logging
+logging.basicConfig(
+    filename='training.log',
+    level=logging.INFO,
+    format='%(asctime)s - %(message)s'
+)
 
-# Ensure dataset is not empty
-if len(dataset) == 0:
-    raise ValueError("Dataset is empty. Check musan_dir path and dataset files.")
+class AudioSteganographyGAN:
+    def __init__(self, config):
+        self.device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
+        self.config = config
 
-# Split dataset
-train_size = int(0.6 * len(dataset))
-val_size = int(0.2 * len(dataset))
-test_size = len(dataset) - train_size - val_size
+        # Initialize models
+        self.encoder = DenseEncoder(
+            data_depth=config['data_depth'],
+            hidden_size=config['hidden_size']
+        ).to(self.device)
 
-# Ensure train/val/test sizes are valid
-if train_size == 0 or val_size == 0 or test_size == 0:
-    raise ValueError("One of the dataset splits is zero. Consider increasing dataset size.")
+        self.decoder = DenseDecoder(
+            data_depth=config['data_depth'],
+            hidden_size=config['hidden_size']
+        ).to(self.device)
 
-print(f"Train: {train_size}, Val: {val_size}, Test: {test_size}")
-train_set, val_set, test_set = torch.utils.data.random_split(dataset, [train_size, val_size, test_size])
+        self.critic = BasicCritic(
+            hidden_size=config['hidden_size']
+        ).to(self.device)
 
-def collate_fn(batch):
-    noisy_mels, mask, info = zip(*batch)
-    noisy_mels = torch.stack(noisy_mels)
-    mask = torch.stack(mask)
-    return noisy_mels, mask, info
-
-train_loader = data.DataLoader(train_set, batch_size=BATCH_SIZE, shuffle=True, collate_fn=collate_fn)
-val_loader = data.DataLoader(val_set, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-test_loader = data.DataLoader(test_set, batch_size=BATCH_SIZE, shuffle=False, collate_fn=collate_fn)
-
-# Define CNN + LSTM Model
-class CNN_LSTM(nn.Module):
-    def __init__(self, n_mels=128, hidden_size=128, num_layers=2, max_frames=186):
-        super(CNN_LSTM, self).__init__()
-
-        self.max_frames = max_frames
-
-        # Add batch normalization to CNN layers
-        self.cnn = nn.Sequential(
-            nn.Conv2d(1, 16, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(16),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2),
-            nn.Conv2d(16, 32, kernel_size=3, stride=1, padding=1),
-            nn.BatchNorm2d(32),
-            nn.ReLU(),
-            nn.MaxPool2d(kernel_size=2, stride=2)
+        # Initialize optimizers
+        self.encoder_optimizer = optim.Adam(
+            self.encoder.parameters(),
+            lr=config['learning_rate']
+        )
+        self.decoder_optimizer = optim.Adam(
+            self.decoder.parameters(),
+            lr=config['learning_rate']
+        )
+        self.critic_optimizer = optim.Adam(
+            self.critic.parameters(),
+            lr=config['learning_rate']
         )
 
-        # Calculate sizes after CNN
-        self.n_mels_conv = n_mels // 4
-        self.time_dim_conv = max_frames // 4
+        # Loss functions
+        self.mse_loss = nn.MSELoss()
+        self.bce_loss = nn.BCEWithLogitsLoss()
 
-        self.lstm = nn.LSTM(input_size=(n_mels//4)*32, hidden_size=hidden_size, num_layers=num_layers, batch_first=True)
-        self.fc = nn.Linear(hidden_size, n_mels)
-        self.upsample = nn.Upsample(size=(n_mels, max_frames), mode='bilinear', align_corners=False)
-        self.final_activation = nn.Sigmoid()  # Thêm sigmoid để normalize output về [0,1]
+        # Initialize best losses for model saving
+        self.best_encoder_loss = float('inf')
 
-    def forward(self, x):
-        batch_size = x.size(0)
+        # Add gradient clipping
+        self.grad_clip = config.get('grad_clip', 1.0)
 
-        # Ensure input has correct time dimension
-        if x.size(3) != self.max_frames:
-            x = nn.functional.pad(x, (0, self.max_frames - x.size(3), 0, 0), mode='constant', value=0)
+        # Enable gradient scaler for mixed precision
+        self.scaler = torch.amp.GradScaler()
 
-        x = self.cnn(x)  # [batch, 32, n_mels/4, time_frames/4]
-        x = x.permute(0, 3, 1, 2).contiguous()  # [batch, time_frames/4, 32, n_mels/4]
-        x = x.view(batch_size, self.time_dim_conv, -1)  # [batch, time_frames/4, feature_size]
+        # Add accuracy threshold
+        self.accuracy_threshold = 0.5
 
-        x, _ = self.lstm(x)
-        x = self.fc(x)  # [batch, time_frames/4, n_mels]
+        # Critic iterations
+        self.critic_iters = 5  # Train critic ít hơn
 
-        # Reshape and upsample to match target dimensions
-        x = x.permute(0, 2, 1).contiguous().unsqueeze(1)  # [batch, 1, n_mels, time_frames/4]
-        x = self.upsample(x)  # [batch, 1, n_mels, max_frames]
-        x = self.final_activation(x)  # Normalize output
+    def calculate_accuracy(self, predictions, targets):
+        """Calculate binary accuracy"""
+        pred_labels = (predictions > self.accuracy_threshold).float()
+        return (pred_labels == targets).float().mean().item()
 
-        return x
+    def train(self, train_loader):
+        """Training loop based on fit_gan approach"""
+        torch.cuda.empty_cache()
 
-# Initialize model, loss, optimizer
-device = torch.device("cuda" if torch.cuda.is_available() else "cpu")
-model = CNN_LSTM().to(device)
-criterion = nn.BCELoss()  # Use BCE loss thay vì MSE vì đã normalize data về [0,1]
-optimizer = optim.Adam(model.parameters(), lr=LEARNING_RATE)
+        for epoch in range(self.config['epochs']):
+            print(f"Epoch {epoch+1}/{self.config['epochs']}")
+            metrics = {'train.encoder_mse': [], 'train.decoder_loss': [],
+                      'train.decoder_acc': [], 'train.cover_score': [],
+                      'train.generated_score': []}
 
-def train_model():
-    # Set up MLflow experiment
-    mlflow.set_experiment("Audio_Noise_Detection")
+            critic_iter = 0
 
-    with mlflow.start_run():
-        # Log hyperparameters
-        mlflow.log_params({
-            "batch_size": BATCH_SIZE,
-            "epochs": EPOCHS,
-            "learning_rate": LEARNING_RATE,
-            "model_type": "CNN_LSTM",
-            "hidden_size": 128,
-            "num_layers": 2
-        })
+            for i, (cover, _) in enumerate(tqdm(train_loader)):
+                # Clear memory mỗi 100 iterations
+                if i % 100 == 0:
+                    torch.cuda.empty_cache()
+                    gc.collect()
 
-        best_val_loss = float('inf')
+                with torch.amp.autocast(device_type=self.device.type):  # Enable mixed precision
+                    cover = cover.to(self.device, non_blocking=True)
+                    N, _, H, W = cover.size()
+                    payload = torch.zeros((N, self.config['data_depth'], H, W),
+                                      device=self.device).random_(0, 2)
 
-        for epoch in range(EPOCHS):
-            # Training phase
-            model.train()
-            total_loss = 0
+                    # Train critic mỗi critic_iters lần
+                    if critic_iter < self.critic_iters:
+                        generated = self.encoder(cover, payload)
+                        cover_score = self.critic(cover).mean()
+                        fake_score = self.critic(generated.detach()).mean()
 
-            # Use tqdm for progress tracking
-            progress_bar = tqdm(train_loader, desc=f"Epoch {epoch+1}/{EPOCHS}")
+                        critic_loss = -(cover_score - fake_score)
+                        self.critic_optimizer.zero_grad(set_to_none=True)
+                        self.scaler.scale(critic_loss).backward()
+                        self.scaler.step(self.critic_optimizer)
+                        self.scaler.update()
 
-            for batch_idx, (noisy_mel, mask_mel, info) in enumerate(progress_bar):
-                noisy_mel, mask_mel = noisy_mel.to(device), mask_mel.to(device)
+                        # Clamp weights
+                        for p in self.critic.parameters():
+                            p.data.clamp_(-0.1, 0.1)
 
-                # Forward pass
-                optimizer.zero_grad()
-                outputs = model(noisy_mel)
+                        # Update metrics for critic training
+                        metrics['train.cover_score'].append(cover_score.item())
+                        metrics['train.generated_score'].append(fake_score.item())
 
-                # Calculate loss
-                loss = criterion(outputs, mask_mel)
+                        critic_iter += 1
+                    else:
+                        # Train encoder-decoder
+                        generated = self.encoder(cover, payload)
+                        decoded = self.decoder(generated)
+                        fake_score = self.critic(generated).mean()
 
-                # Backward pass
-                loss.backward()
+                        encoder_mse = self.mse_loss(generated, cover)
+                        decoder_loss = self.bce_loss(decoded, payload)
+                        decoder_acc = self.calculate_accuracy(decoded, payload)
 
-                # Add gradient clipping
-                torch.nn.utils.clip_grad_norm_(model.parameters(), max_norm=1.0)
+                        total_loss = 100 * encoder_mse + decoder_loss - fake_score
 
-                optimizer.step()
+                        self.encoder_optimizer.zero_grad(set_to_none=True)
+                        self.decoder_optimizer.zero_grad(set_to_none=True)
+                        self.scaler.scale(total_loss).backward()
+                        self.scaler.step(self.encoder_optimizer)
+                        self.scaler.step(self.decoder_optimizer)
+                        self.scaler.update()
 
-                # Update metrics
-                total_loss += loss.item()
-                current_loss = total_loss / (batch_idx + 1)
+                        # Update metrics for encoder-decoder training
+                        metrics['train.encoder_mse'].append(encoder_mse.item())
+                        metrics['train.decoder_loss'].append(decoder_loss.item())
+                        metrics['train.decoder_acc'].append(decoder_acc)
+                        metrics['train.generated_score'].append(fake_score.item())
 
-                # Update progress bar
-                progress_bar.set_postfix({
-                    'loss': f'{current_loss:.4f}',
-                })
+                        critic_iter = 0
 
-            # Validation phase
-            model.eval()
-            val_loss = 0
-            val_accuracy = 0
-            total_samples = 0
+            # Print epoch results
+            print('encoder_mse: %.3f - decoder_loss: %.3f - decoder_acc: %.3f - cover_score: %.3f - generated_score: %.3f'
+                  %(np.mean(metrics['train.encoder_mse']),
+                    np.mean(metrics['train.decoder_loss']),
+                    np.mean(metrics['train.decoder_acc']),
+                    np.mean(metrics['train.cover_score']),
+                    np.mean(metrics['train.generated_score'])))
 
-            with torch.no_grad():
-                for noisy_mel, mask_mel, _ in val_loader:
-                    noisy_mel, mask_mel = noisy_mel.to(device), mask_mel.to(device)
-                    outputs = model(noisy_mel)
-                    val_loss += criterion(outputs, mask_mel).item()
+            # Save model periodically
+            if (epoch + 1) % self.config.get('save_interval', 5) == 0:
+                self.save_models(f'model_epoch_{epoch+1}')
 
-                    # Calculate accuracy (threshold = 0.5)
-                    predicted = (outputs > 0.5).float()
-                    val_accuracy += (predicted == mask_mel).float().mean().item()
-                    total_samples += 1
+    def save_models(self, prefix):
+        save_dir = Path('models')
+        save_dir.mkdir(exist_ok=True)
 
-            # Calculate average metrics
-            avg_train_loss = total_loss / len(train_loader)
-            avg_val_loss = val_loss / len(val_loader)
-            avg_val_accuracy = val_accuracy / total_samples
+        torch.save(self.encoder.state_dict(), save_dir / f'{prefix}_encoder.pth')
+        torch.save(self.decoder.state_dict(), save_dir / f'{prefix}_decoder.pth')
+        torch.save(self.critic.state_dict(), save_dir / f'{prefix}_critic.pth')
 
-            # Log metrics to MLflow
-            mlflow.log_metrics({
-                "train_loss": avg_train_loss,
-                "val_loss": avg_val_loss,
-                "val_accuracy": avg_val_accuracy
-            }, step=epoch)
+        # Save training config
+        with open(save_dir / f'{prefix}_config.txt', 'w') as f:
+            for key, value in self.config.items():
+                f.write(f'{key}: {value}\n')
 
-            print(f"\nEpoch {epoch+1}/{EPOCHS}")
-            print(f"Train Loss: {avg_train_loss:.4f}")
-            print(f"Val Loss: {avg_val_loss:.4f}")
-            print(f"Val Accuracy: {avg_val_accuracy:.4f}")
+if __name__ == '__main__':
+    # Training configuration
+    config = {
+        'data_depth': 1,          # Depth of secret message
+        'hidden_size': 64,        # Number of hidden channels
+        'learning_rate': 1e-4,
+        'batch_size': 8,         # Reduced batch size
+        'epochs': 10,
+        'input_size': 360,        # STFT size
+        'grad_clip': 1.0,         # Added gradient clipping
+        'save_interval': 5        # Save model every 5 epochs
+    }
 
-        # Save best model
-        torch.save({
-            'epoch': epoch,
-            'model_state_dict': model.state_dict(),
-            'optimizer_state_dict': optimizer.state_dict(),
-            'val_loss': best_val_loss,
-        }, "models/best_model.pth")
-        print("Saved new best model!")
+    # Enable memory efficient options
+    torch.backends.cudnn.benchmark = True
 
-        # Log final model to MLflow
-        mlflow.pytorch.log_model(model, "final_model")
-        print("Training complete!")
+    # Initialize train dataset
+    train_dataset = AudioDataset('datasets/processed/train', normalize=True)
 
-# Run training
-if __name__ == "__main__":
-    # Create models directory if it doesn't exist
-    os.makedirs("models", exist_ok=True)
-    train_model()
+    # Create dataloader
+    train_loader = DataLoader(
+        train_dataset,
+        batch_size=config['batch_size'],
+        shuffle=True,
+        num_workers=2,
+    )
 
-# Load Model
-def load_and_evaluate():
-    try:
-        checkpoint = torch.load("models/250316_cnn_lstm_loss_0.113_acc_0.9383.pth", map_location=device)
-        model.load_state_dict(checkpoint['model_state_dict'])
-        model.eval()
-
-        test_loss = 0
-        test_accuracy = 0
-        total_samples = 0
-
-        with torch.no_grad():
-            for noisy_mel, mask_mel, _ in tqdm(test_loader, desc="Evaluating"):
-                noisy_mel, mask_mel = noisy_mel.to(device), mask_mel.to(device)
-                outputs = model(noisy_mel)
-                test_loss += criterion(outputs, mask_mel).item()
-
-                # Calculate accuracy
-                predicted = (outputs > 0.5).float()
-                test_accuracy += (predicted == mask_mel).float().mean().item()
-                total_samples += 1
-
-        avg_test_loss = test_loss / len(test_loader)
-        avg_test_accuracy = test_accuracy / total_samples
-
-        print(f"Test Loss: {avg_test_loss:.4f}")
-        print(f"Test Accuracy: {avg_test_accuracy:.4f}")
-
-        return avg_test_loss, avg_test_accuracy
-
-    except Exception as e:
-        print(f"Error loading or evaluating model: {str(e)}")
-        return None, None
-
-# Evaluate model
-load_and_evaluate()
+    # Initialize and train model
+    model = AudioSteganographyGAN(config)
+    model.train(train_loader)
