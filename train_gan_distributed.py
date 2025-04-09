@@ -75,8 +75,60 @@ def get_data_loader(dataset, batch_size, rank, world_size):
         persistent_workers=True
     )
 
-def train_distributed(local_rank, world_size, node_rank, nodes, master_addr,
-                     master_port, batch_size=10, epochs=10, dataset_path='datasets/processed'):
+def save_model(encoder, decoder, critic, en_de_optimizer, cr_optimizer, metrics, ep, save_dir='models/distributed'):
+    """Save model checkpoints for distributed training
+    Note: This should only be called from rank 0 process
+    """
+    os.makedirs(save_dir, exist_ok=True)
+    now = datetime.datetime.now()
+
+    # Get the average validation accuracy across all processes
+    if 'val.decoder_acc' in metrics and len(metrics['val.decoder_acc']) > 0:
+        cover_score = metrics['val.decoder_acc'][-1]
+    else:
+        cover_score = 0.0
+
+    name = f"distributed_{encoder.__class__.__name__}_{decoder.__class__.__name__}_{cover_score:.3f}_{now.strftime('%Y-%m-%d_%Hh%Mm%S')}.pt"
+    fname = os.path.join(save_dir, name)
+
+    states = {
+        'state_dict_encoder': encoder.state_dict(),
+        'state_dict_decoder': decoder.state_dict(),
+        'state_dict_critic': critic.state_dict(),
+        'en_de_optimizer': en_de_optimizer.state_dict(),
+        'cr_optimizer': cr_optimizer.state_dict(),
+        'metrics': metrics,
+        'train_epoch': ep,
+        'date': now.strftime("%Y-%m-%d_%H:%M:%S"),
+    }
+    torch.save(states, fname)
+    logger.info(f"Saved checkpoint to {fname}")
+
+    # Save latest model for easy loading
+    latest_path = os.path.join(save_dir, "latest_model.pt")
+    torch.save(states, latest_path)
+
+def load_model(encoder, decoder, critic, en_de_optimizer, cr_optimizer, path, device):
+    """Load saved model checkpoint for distributed training"""
+    logger.info(f"Loading checkpoint from {path}")
+
+    loc = f'cuda:{device}' if torch.cuda.is_available() else 'cpu'
+    checkpoint = torch.load(path, map_location=loc)
+
+    encoder.load_state_dict(checkpoint['state_dict_encoder'])
+    decoder.load_state_dict(checkpoint['state_dict_decoder'])
+    critic.load_state_dict(checkpoint['state_dict_critic'])
+
+    # Only load optimizer states on rank 0
+    if dist.get_rank() == 0:
+        en_de_optimizer.load_state_dict(checkpoint['en_de_optimizer'])
+        cr_optimizer.load_state_dict(checkpoint['cr_optimizer'])
+
+    return checkpoint['metrics'], checkpoint['train_epoch'], checkpoint['date']
+
+def train_distributed(local_rank, world_size, node_rank, nodes, master_addr, master_port,
+                     batch_size=10, epochs=10, dataset_path='datasets/processed',
+                     load_checkpoint=None):
     """
     Main training function for distributed training
     Args:
@@ -89,6 +141,7 @@ def train_distributed(local_rank, world_size, node_rank, nodes, master_addr,
         batch_size: Batch size per GPU
         epochs: Number of training epochs
         dataset_path: Path to dataset (must be same on all nodes)
+        load_checkpoint: Path to checkpoint file to resume training
     """
     # Calculate global rank
     global_rank = node_rank * torch.cuda.device_count() + local_rank
@@ -137,19 +190,29 @@ def train_distributed(local_rank, world_size, node_rank, nodes, master_addr,
     if global_rank == 0:
         writer = SummaryWriter(f"./logs/distributed")
 
-    # Initialize metrics dictionary
-    metrics = {field: [] for field in [
-        'val.encoder_mse', 'val.decoder_loss', 'val.decoder_acc',
-        'val.cover_score', 'val.generated_score', 'val.ssim',
-        'val.psnr', 'val.bpp', 'train.encoder_mse',
-        'train.decoder_loss', 'train.decoder_acc',
-        'train.cover_score', 'train.generated_score',
-    ]}
+    # Load checkpoint if specified
+    if load_checkpoint and os.path.exists(load_checkpoint):
+        metrics, start_epoch, date = load_model(
+            encoder, decoder, critic,
+            en_de_optimizer, cr_optimizer,
+            load_checkpoint, local_rank
+        )
+        if global_rank == 0:
+            logger.info(f"Resumed training from checkpoint saved at {date}")
+    else:
+        start_epoch = 0
+        metrics = {field: [] for field in [
+            'val.encoder_mse', 'val.decoder_loss', 'val.decoder_acc',
+            'val.cover_score', 'val.generated_score', 'val.ssim',
+            'val.psnr', 'val.bpp', 'train.encoder_mse',
+            'train.decoder_loss', 'train.decoder_acc',
+            'train.cover_score', 'train.generated_score',
+        ]}
 
     # Training loop
     scaler = amp.GradScaler()
 
-    for ep in range(epochs):
+    for ep in range(start_epoch, epochs):
         train_loader.sampler.set_epoch(ep)
 
         if global_rank == 0:
@@ -192,6 +255,8 @@ if __name__ == "__main__":
     parser.add_argument('--epochs', type=int, default=10)
     parser.add_argument('--dataset-path', type=str, default='datasets/processed',
                         help='Path to dataset directory')
+    parser.add_argument('--load-checkpoint', type=str, default=None,
+                       help='Path to checkpoint file to resume training')
     args = parser.parse_args()
 
     # Calculate world size (total processes = nodes * gpus per node)
@@ -203,7 +268,8 @@ if __name__ == "__main__":
         train_distributed,
         args=(world_size, args.node_rank, args.nodes,
               args.master_addr, args.master_port,
-              args.batch_size, args.epochs, args.dataset_path),
+              args.batch_size, args.epochs, args.dataset_path,
+              args.load_checkpoint),
         nprocs=n_gpus_per_node,
         join=True
     )
