@@ -6,7 +6,7 @@ from critic import BasicCritic
 from encoder import DenseEncoder
 from decoder import DenseDecoder
 from utils.audio_to_stft import audio_to_stft, stft_to_audio
-from utils.text_conversion import text_to_bits, bits_to_text
+from utils.text_conversion import bits_to_bytearray, bytearray_to_text, text_to_bits, bits_to_text
 from utils.bit_accuracy import compare_bits
 import numpy as np
 import matplotlib.pyplot as plt
@@ -15,14 +15,15 @@ from PIL import Image
 import librosa
 import librosa.display
 import soundfile as sf
+from collections import Counter
 
 
-def load_trained_models(model_path, data_depth=1, hidden_size=64, device='cuda'):
+def load_trained_models(model_path, data_depth=1, hidden_size=64, channels_size=3, device='cuda'):
     """Load trained encoder and decoder models"""
     # Initialize models
-    encoder = DenseEncoder(data_depth, hidden_size).to(device)
-    decoder = DenseDecoder(data_depth, hidden_size).to(device)
-    critic = BasicCritic(hidden_size).to(device)
+    encoder = DenseEncoder(data_depth, hidden_size, channels_size).to(device)
+    decoder = DenseDecoder(data_depth, hidden_size, channels_size).to(device)
+    critic = BasicCritic(hidden_size, channels_size).to(device)
 
     # Load checkpoint
     checkpoint = torch.load(model_path, map_location=device)
@@ -96,7 +97,7 @@ def test_hiding(encoder, decoder, audio_path, message, data_depth, device='cuda'
     cover = cover.to(device)
 
     # Convert message to binary with error correction
-    message_bits = text_to_bits(message)
+    message_bits = text_to_bits(message) + [0] * 32
     message_len = len(message_bits)
     print(f"Message bits:", message_bits[:32])
     print(f"Message length in bits: {message_len}")
@@ -109,116 +110,141 @@ def test_hiding(encoder, decoder, audio_path, message, data_depth, device='cuda'
     if message_len > total_bits:
         raise ValueError(f"Message too long! Max bits: {total_bits}, Message bits: {message_len}")
 
-    # Create payload tensor - only use exact message length
-    payload_bits = np.zeros(total_bits, dtype=np.float32)  # Change to float32
-    payload_bits[:message_len] = message_bits
+    payload_bits = message_bits
+    while len(payload_bits) < W * H * data_depth:
+        payload_bits += message_bits
+
+    payload_bits = payload_bits[:W * H * data_depth]
 
     # Reshape payload to match training format
-    payload = torch.tensor(payload_bits, device=device).float()
-    payload = payload.reshape(N, data_depth, H, W)
+    payload = torch.FloatTensor(payload_bits).view(1, data_depth, H, W)
+    payload = payload.to(device)
 
     # Generate marked audio
-    with torch.no_grad():
-        generated = encoder(cover, payload)
+    # with torch.no_grad():
+    generated = encoder.forward(cover, payload)
 
-        # Save generated audio if requested
-        if save_audio:
-            # Create output directory if needed
-            os.makedirs('output', exist_ok=True)
+    # Save generated audio if requested
+    if save_audio:
+        # Create output directory if needed
+        os.makedirs('output', exist_ok=True)
 
-            # Get real and imaginary components from generated spectrogram
-            generated_numpy = generated.cpu().squeeze().numpy() # (3, 360, 360)
-            print(f"Generated shape: {generated_numpy.shape}")
-            # Convert to audio using only real and imaginary components
-            generated_stft = generated_numpy[:2]  # Only real and imaginary parts (2, 360, 360)
-            audio_signal = stft_to_audio(
-                generated_stft,
-                hop_length=hop_length
-            )
+        # Get real and imaginary components from generated spectrogram
+        generated_numpy = generated.cpu().squeeze().numpy() # (3, 360, 360)
+        print(f"Generated shape: {generated_numpy.shape}")
+        # Convert to audio using only real and imaginary components
+        generated_stft = generated_numpy[:2]  # Only real and imaginary parts (2, 360, 360)
+        audio_signal = stft_to_audio(
+            generated_stft,
+            hop_length=hop_length
+        )
 
-            output_path = os.path.join('output', 'marked_audio.wav')
-            sf.write(output_path, audio_signal, sr)
-            print(f"\nSaved marked audio to: {output_path}")
+        output_path = os.path.join('output', 'marked_audio.wav')
+        sf.write(output_path, audio_signal, sr)
+        print(f"\nSaved marked audio to: {output_path}")
 
-        decoded = decoder(generated)
+    decoded = decoder.forward(generated)
 
-        # print("\nDecoder raw output (logits):")
-        # print(decoded)
+    # print("\nDecoder raw output (logits):")
+    # print(decoded)
 
-        # Calculate mean loss across all elements
-        decoder_loss = torch.binary_cross_entropy_with_logits(decoded, payload, reduction=1)
-        decoder_acc = (decoded >= 0.0).eq(payload >= 0.5).sum().float() / payload.numel()
+    # Calculate mean loss across all elements
+    decoder_loss = torch.nn.functional.binary_cross_entropy_with_logits(decoded, payload)
+    decoder_acc = (decoded >= 0.0).eq(payload >= 0.5).sum().float() / payload.numel()
 
-        print(f"Decoder loss: {decoder_loss.item():.3f}")
-        print(f"Decoder accuracy: {decoder_acc.item():.3f}")
+    print(f"Decoder loss: {decoder_loss.item():.3f}")
+    print(f"Decoder accuracy: {decoder_acc.item():.3f}")
 
-        # decoded = decoded[:, :, 1:, :]
-        # Apply threshold to decoded bits
-        decoded_bits = (decoded > 0).int()
+    # # decoded = decoded[:, :, 1:, :]
+    # # Apply threshold to decoded bits
+    # decoded_bits = (decoded > 0).int()
 
-        # print(f"Decoded bits: {decoded_bits}")
+    # # print(f"Decoded bits: {decoded_bits}")
 
-        decoded_bits_str = ''.join(map(str, decoded_bits.flatten().tolist()))
-        decoded_bits_str = decoded_bits_str[:message_len]
+    # decoded_bits_str = ''.join(map(str, decoded_bits.flatten().tolist()))
+    # decoded_bits_str = decoded_bits_str[:message_len]
 
-        print(f"Decoded bits: {decoded_bits_str[:32]}")
+    # print(f"Decoded bits: {decoded_bits_str[:32]}")
 
-        # Compare original and decoded bits
-        compare_bits(str(message_bits), decoded_bits_str)
+    # # Compare original and decoded bits
+    # compare_bits(str(message_bits), decoded_bits_str)
 
-        # Try decoding message
-        decoded_message = bits_to_text(decoded_bits_str)
-        print(f"\nOriginal message: {message}")
-        print(f"Decoded message: {decoded_message}")
+    # # Try decoding message
+    # decoded_message = bits_to_text(decoded_bits_str)
+    # print(f"\nOriginal message: {message}")
+    # print(f"Decoded message: {decoded_message}")
+
+    generated = generated.to(device)
+    decoded = decoder(generated).view(-1) > 0
+    decoded = torch.tensor(decoded, dtype=torch.uint8)
+
+    candidates = Counter()
+    bits = decoded.data.cpu().numpy().tolist()
+    print(f"Decoded bits: {bits[:32]}")
+    for candidate in bits_to_bytearray(bits).split(b'\x00\x00\x00\x00'):
+
+        if candidate in [bytearray(b''), bytearray(b' ')]:
+            continue
+
+        candidate = bytearray_to_text(bytearray(candidate))
+        if candidate:
+            candidates[candidate] += 1
+
+    if len(candidates) == 0:
+        print("No candidates found")
+        return
+
+    candidate, count = candidates.most_common(1)[0]
+    print(f"Decoded message: {candidate}")
 
     # Visualize results
-    fig = plt.figure(figsize=(15, 10))
+    # fig = plt.figure(figsize=(15, 10))
 
-    # Original spectrograms
-    ax1 = plt.subplot(2, 2, 1)
-    real_db_orig = librosa.amplitude_to_db(np.abs(cover.cpu().squeeze()[0]), ref=np.max)
-    img1 = librosa.display.specshow(real_db_orig,
-                                  y_axis='linear',
-                                  x_axis='time',
-                                  ax=ax1,
-                                  cmap='magma')
-    ax1.set_title('Original Real Part')
-    fig.colorbar(img1, ax=ax1, format="%+2.f dB")
+    # # Original spectrograms
+    # ax1 = plt.subplot(2, 2, 1)
+    # real_db_orig = librosa.amplitude_to_db(np.abs(cover.cpu().detach().squeeze()[0]), ref=np.max)
+    # img1 = librosa.display.specshow(real_db_orig,
+    #                               y_axis='linear',
+    #                               x_axis='time',
+    #                               ax=ax1,
+    #                               cmap='magma')
+    # ax1.set_title('Original Real Part')
+    # fig.colorbar(img1, ax=ax1, format="%+2.f dB")
 
-    ax2 = plt.subplot(2, 2, 2)
-    imag_db_orig = librosa.amplitude_to_db(np.abs(cover.cpu().squeeze()[1]), ref=np.max)
-    img2 = librosa.display.specshow(imag_db_orig,
-                                  y_axis='linear',
-                                  x_axis='time',
-                                  ax=ax2,
-                                  cmap='magma')
-    ax2.set_title('Original Imaginary Part')
-    fig.colorbar(img2, ax=ax2, format="%+2.f dB")
+    # ax2 = plt.subplot(2, 2, 2)
+    # imag_db_orig = librosa.amplitude_to_db(np.abs(cover.cpu().detach().squeeze()[1]), ref=np.max)
+    # img2 = librosa.display.specshow(imag_db_orig,
+    #                               y_axis='linear',
+    #                               x_axis='time',
+    #                               ax=ax2,
+    #                               cmap='magma')
+    # ax2.set_title('Original Imaginary Part')
+    # fig.colorbar(img2, ax=ax2, format="%+2.f dB")
 
-    # Marked spectrograms
-    ax3 = plt.subplot(2, 2, 3)
-    real_db_marked = librosa.amplitude_to_db(np.abs(generated.cpu().squeeze()[0]), ref=np.max)
-    img3 = librosa.display.specshow(real_db_marked,
-                                  y_axis='linear',
-                                  x_axis='time',
-                                  ax=ax3,
-                                  cmap='magma')
-    ax3.set_title('Marked Real Part')
-    fig.colorbar(img3, ax=ax3, format="%+2.f dB")
+    # # Marked spectrograms
+    # ax3 = plt.subplot(2, 2, 3)
+    # real_db_marked = librosa.amplitude_to_db(np.abs(generated.cpu().detach().squeeze()[0]), ref=np.max)
+    # img3 = librosa.display.specshow(real_db_marked,
+    #                               y_axis='linear',
+    #                               x_axis='time',
+    #                               ax=ax3,
+    #                               cmap='magma')
+    # ax3.set_title('Marked Real Part')
+    # fig.colorbar(img3, ax=ax3, format="%+2.f dB")
 
-    ax4 = plt.subplot(2, 2, 4)
-    imag_db_marked = librosa.amplitude_to_db(np.abs(generated.cpu().squeeze()[1]), ref=np.max)
-    img4 = librosa.display.specshow(imag_db_marked,
-                                  y_axis='linear',
-                                  x_axis='time',
-                                  ax=ax4,
-                                  cmap='magma')
-    ax4.set_title('Marked Imaginary Part')
-    fig.colorbar(img4, ax=ax4, format="%+2.f dB")
+    # ax4 = plt.subplot(2, 2, 4)
+    # imag_db_marked = librosa.amplitude_to_db(np.abs(generated.cpu().detach().squeeze()[1]), ref=np.max)
+    # img4 = librosa.display.specshow(imag_db_marked,
+    #                               y_axis='linear',
+    #                               x_axis='time',
+    #                               ax=ax4,
+    #                               cmap='magma')
+    # ax4.set_title('Marked Imaginary Part')
+    # fig.colorbar(img4, ax=ax4, format="%+2.f dB")
 
-    fig.suptitle('Spectrogram Comparison: Original vs Marked')
-    plt.tight_layout()
-    plt.savefig('marked_spectrogram.png', dpi=300, bbox_inches='tight')
+    # fig.suptitle('Spectrogram Comparison: Original vs Marked')
+    # plt.tight_layout()
+    # plt.savefig('marked_spectrogram.png', dpi=300, bbox_inches='tight')
     # plt.show()
 
 
@@ -227,23 +253,26 @@ if __name__ == '__main__':
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
     # model_path = 'models/DenseEncoder_DenseDecoder_0.962_2025-04-05_22h46m42.dat'
     # model_path = 'models/DenseEncoder_DenseDecoder_0.964_2025-04-05_22h22m10.dat'
-    model_path = 'models/DenseEncoder_DenseDecoder_0.915_2025-04-09_12h08m20.dat'
-    # model_path = 'models/DenseEncoder_DenseDecoder_0.913_2025-04-09_11h55m52.dat'
-    data_depth = 2
-    hidden_size = 128
-    save_audio = True
+    # model_path = 'models/DenseEncoder_DenseDecoder_0.915_2025-04-09_12h08m20.dat'
+    model_path = 'models/DenseEncoder_DenseDecoder_0.832_2025-04-10_00h32m49.dat'
+    channels_size = 3
+    data_depth = 4
+    hidden_size = 32
+    save_audio = False
 
     # Load models
     encoder, decoder = load_trained_models(
         model_path,
         data_depth=data_depth,
         hidden_size=hidden_size,
+        channels_size=channels_size,
         device=device
     )
 
     # Test with text message
-    # audio_path = "D:\\Backup\\musan\\music\\fma\\music-fma-0000.wav"
-    audio_path = "D:\\Backup\\musan\\music\\fma-western-art\\music-fma-wa-0008.wav"
+    audio_path = "D:\\Backup\\musan\\speech\\librivox\\speech-librivox-0003.wav"
+    # audio_path = "D:\\Backup\\musan\\speech\\us-gov\\speech-us-gov-0003.wav"
+    # audio_path = "D:\\Backup\\musan\\music\\jamendo\\music-jamendo-0000.wav"
     message = "hello"
 
     marked_spectrogram = test_hiding(encoder, decoder, audio_path, message, data_depth, device, save_audio)

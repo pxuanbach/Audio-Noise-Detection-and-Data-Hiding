@@ -1,4 +1,5 @@
 import logging
+import numpy as np
 import torch
 import torch.nn as nn
 import torch.amp as amp
@@ -104,9 +105,6 @@ def fit_gan(encoder, decoder, critic, en_de_optimizer, cr_optimizer, metrics, tr
         use_gradient_checkpointing: If True, enables gradient checkpointing to reduce memory usage
                                   at the cost of increased computation time
     """
-    # Initialize mixed precision training
-    scaler = amp.GradScaler()
-
     if writer is None:
         writer = SummaryWriter("./logs")
         logger.info(f'Tensorboard logs stored in: {writer.get_logdir()}')
@@ -130,28 +128,24 @@ def fit_gan(encoder, decoder, critic, en_de_optimizer, cr_optimizer, metrics, tr
             iter_train_critic += 1
             gc.collect()
 
-            with amp.autocast(device_type=device.type):
-                cover = cover.to(device)
-                N, _, H, W = cover.size()
+            cover = cover.to(device)
+            N, _, H, W = cover.size()
 
-                # Generate payload and encoded image
-                payload = torch.zeros((N, encoder.data_depth, H, W), device=device).random_(0, 2)
-                generated = encoder(cover, payload)
+            # Generate payload and encoded image
+            payload = torch.zeros((N, encoder.data_depth, H, W), device=device).random_(0, 2)
+            generated = encoder.forward(cover, payload)
 
-                # Get critic scores
-                cover_score = torch.mean(critic(cover))
-                generated_score = torch.mean(critic(generated))
+            # Get critic scores
+            cover_score = torch.mean(critic.forward(cover))
+            generated_score = torch.mean(critic.forward(generated))
 
-                # Update critic
-                cr_optimizer.zero_grad()
-                scaler.scale(cover_score - generated_score).backward(retain_graph=False)
-                scaler.step(cr_optimizer)
-                scaler.update()
+            # Update critic
+            cr_optimizer.zero_grad()
+            (cover_score - generated_score).backward(retain_graph=False)
+            cr_optimizer.step()
 
-            # Clamp critic weights
-            with torch.no_grad():
-                for p in critic.parameters():
-                    p.data.clamp_(-0.1, 0.1)
+            for p in critic.parameters():
+                p.data.clamp_(-0.1, 0.1)
 
             # Log metrics
             writer.add_scalar('cover_score/train', cover_score.item(), iter_train_critic)
@@ -162,109 +156,130 @@ def fit_gan(encoder, decoder, critic, en_de_optimizer, cr_optimizer, metrics, tr
             # Log critic gradients
             for tag, value in critic.named_parameters():
                 tag = tag.replace('.', '/')
-                safe_add_histogram(writer, 'critic/'+tag, value, iter_train_critic)
-                if value.grad is not None:
-                    safe_add_histogram(writer, 'critic/'+tag+'/grad', value.grad, iter_train_critic)
-
-            torch.cuda.empty_cache()
+                writer.add_histogram(
+                    'critic/' + tag,
+                    value.data.cpu().numpy(),
+                    iter_train_critic
+                )
+                writer.add_histogram(
+                    'critic/' + tag + '/grad',
+                    value.grad.data.cpu().numpy(),
+                    iter_train_critic
+                )
+                # safe_add_histogram(writer, 'critic/'+tag, value, iter_train_critic)
+                # if value.grad is not None:
+                #     safe_add_histogram(writer, 'critic/'+tag+'/grad', value.grad, iter_train_critic)
 
         # Train encoder-decoder
         for cover, *rest in tqdm(train_loader, desc='Training encoder-decoder'):
             iter_train_enc_dec += 1
             gc.collect()
 
-            with amp.autocast(device_type=device.type):
-                cover = cover.to(device)
-                N, _, H, W = cover.size()
+            cover = cover.to(device)
+            N, _, H, W = cover.size()
 
-                # Generate payload and encoded image
-                payload = torch.zeros((N, encoder.data_depth, H, W), device=device).random_(0, 2)
-                generated = encoder(cover, payload)
-                decoded = decoder(generated)
+            # Generate payload and encoded image
+            payload = torch.zeros((N, encoder.data_depth, H, W), device=device).random_(0, 2)
+            generated = encoder.forward(cover, payload)
+            decoded = decoder.forward(generated)
 
-                # Calculate losses
-                encoder_mse = nn.functional.mse_loss(generated, cover)
-                decoder_ce = nn.functional.binary_cross_entropy_with_logits(decoded, payload)
-                decoder_mse = nn.functional.mse_loss(decoded, payload)
-                decoder_acc = (decoded >= 0.0).eq(payload >= 0.5).sum().float() / payload.numel()
-                generated_score = torch.mean(critic(generated))
+            # Calculate losses
+            encoder_mse = nn.functional.mse_loss(generated, cover)
+            decoder_loss = nn.functional.binary_cross_entropy_with_logits(decoded, payload)
+            decoder_acc = (decoded >= 0.0).eq(payload >= 0.5).sum().float() / payload.numel()
+            generated_score = torch.mean(critic.forward(generated))
 
-                # Hybrid loss for decoder
-                decoder_loss = decoder_ce + 0.5 * decoder_mse - 0.1 * generated_score
 
-                # Update encoder-decoder
-                en_de_optimizer.zero_grad()
-                loss = 100 * encoder_mse + decoder_loss
-                scaler.scale(loss).backward()
-                scaler.step(en_de_optimizer)
-                scaler.update()
+            # Update encoder-decoder
+            en_de_optimizer.zero_grad()
+            (100 * encoder_mse + decoder_loss + generated_score).backward()
+            en_de_optimizer.step()
 
             # Log metrics
             writer.add_scalar('encoder_mse/train', encoder_mse.item(), iter_train_enc_dec)
             writer.add_scalar('decoder_loss/train', decoder_loss.item(), iter_train_enc_dec)
             writer.add_scalar('decoder_acc/train', decoder_acc.item(), iter_train_enc_dec)
+
             metrics['train.encoder_mse'].append(encoder_mse.item())
             metrics['train.decoder_loss'].append(decoder_loss.item())
             metrics['train.decoder_acc'].append(decoder_acc.item())
 
-            # Log model gradients
-            for model, name in [(encoder, 'encoder'), (decoder, 'decoder')]:
-                for tag, value in model.named_parameters():
-                    tag = tag.replace('.', '/')
-                    safe_add_histogram(writer, f'{name}/{tag}', value, iter_train_enc_dec)
-                    if value.grad is not None:
-                        safe_add_histogram(writer, f'{name}/{tag}/grad', value.grad, iter_train_enc_dec)
+            for tag, value in encoder.named_parameters():
+                tag = tag.replace('.', '/')
+                writer.add_histogram(
+                    'encoder/'+ tag,
+                    value.data.cpu().numpy(),
+                    iter_train_enc_dec
+                )
+                writer.add_histogram(
+                    'encoder/'+ tag + '/grad',
+                    value.grad.data.cpu().numpy(),
+                    iter_train_enc_dec
+                )
 
-            torch.cuda.empty_cache()
+            for tag, value in decoder.named_parameters():
+                tag = tag.replace('.', '/')
+                writer.add_histogram(
+                    'decoder/' + tag,
+                    value.data.cpu().numpy(),
+                    iter_train_enc_dec
+                )
+                writer.add_histogram(
+                    'decoder/' + tag + '/grad',
+                    value.grad.data.cpu().numpy(),
+                    iter_train_enc_dec
+                )
 
         # Validation
         for cover, *rest in tqdm(valid_loader, desc='Validation'):
             iter_valid += 1
             gc.collect()
 
-            with torch.no_grad(), amp.autocast(device_type=device.type):
-                cover = cover.to(device)
-                N, _, H, W = cover.size()
+            cover = cover.to(device)
+            N, _, H, W = cover.size()
 
-                payload = torch.zeros((N, encoder.data_depth, H, W), device=device).random_(0, 2)
-                generated = encoder(cover, payload)
-                decoded = decoder(generated)
+            payload = torch.zeros((N, encoder.data_depth, H, W), device=device).random_(0, 2)
+            generated = encoder.forward(cover, payload)
+            decoded = decoder.forward(generated)
 
-                # Calculate metrics
-                encoder_mse = nn.functional.mse_loss(generated, cover)
-                decoder_loss = nn.functional.binary_cross_entropy_with_logits(decoded, payload)
-                decoder_acc = (decoded >= 0.0).eq(payload >= 0.5).sum().float() / payload.numel()
-                generated_score = torch.mean(critic(generated))
-                cover_score = torch.mean(critic(cover))
+            # Calculate metrics
+            encoder_mse = nn.functional.mse_loss(generated, cover)
+            decoder_loss = nn.functional.binary_cross_entropy_with_logits(decoded, payload)
+            decoder_acc = (decoded >= 0.0).eq(payload >= 0.5).sum().float() / payload.numel()
+            generated_score = torch.mean(critic.forward(generated))
+            cover_score = torch.mean(critic.forward(cover))
 
-                ssim_val = ssim(cover, generated)
-                psnr = 10 * torch.log10(4 / encoder_mse)
-                bpp = encoder.data_depth * (2 * decoder_acc.item() - 1)
+            ssim_val = ssim(cover, generated)
+            psnr = 10 * torch.log10(4 / encoder_mse)
+            bpp = encoder.data_depth * (2 * decoder_acc.item() - 1)
 
-                # Log validation metrics
-                writer.add_scalar('encoder_mse/test', encoder_mse.item(), iter_valid)
-                writer.add_scalar('decoder_loss/test', decoder_loss.item(), iter_valid)
-                writer.add_scalar('decoder_acc/test', decoder_acc.item(), iter_valid)
-                writer.add_scalar('cover_score/test', cover_score.item(), iter_valid)
-                writer.add_scalar('generated_score/test', generated_score.item(), iter_valid)
-                writer.add_scalar('ssim/test', ssim_val.item(), iter_valid)
-                writer.add_scalar('psnr/test', psnr.item(), iter_valid)
-                writer.add_scalar('bpp/test', bpp, iter_valid)
+            # Log validation metrics
+            writer.add_scalar('encoder_mse/test', encoder_mse.item(), iter_valid)
+            writer.add_scalar('decoder_loss/test', decoder_loss.item(), iter_valid)
+            writer.add_scalar('decoder_acc/test', decoder_acc.item(), iter_valid)
+            writer.add_scalar('cover_score/test', cover_score.item(), iter_valid)
+            writer.add_scalar('generated_score/test', generated_score.item(), iter_valid)
+            writer.add_scalar('ssim/test', ssim_val.item(), iter_valid)
+            writer.add_scalar('psnr/test', psnr.item(), iter_valid)
+            writer.add_scalar('bpp/test', bpp, iter_valid)
 
-                metrics['val.encoder_mse'].append(encoder_mse.item())
-                metrics['val.decoder_loss'].append(decoder_loss.item())
-                metrics['val.decoder_acc'].append(decoder_acc.item())
-                metrics['val.cover_score'].append(cover_score.item())
-                metrics['val.generated_score'].append(generated_score.item())
-                metrics['val.ssim'].append(ssim_val.item())
-                metrics['val.psnr'].append(psnr.item())
-                metrics['val.bpp'].append(bpp)
+            metrics['val.encoder_mse'].append(encoder_mse.item())
+            metrics['val.decoder_loss'].append(decoder_loss.item())
+            metrics['val.decoder_acc'].append(decoder_acc.item())
+            metrics['val.cover_score'].append(cover_score.item())
+            metrics['val.generated_score'].append(generated_score.item())
+            metrics['val.ssim'].append(ssim_val.item())
+            metrics['val.psnr'].append(psnr.item())
+            metrics['val.bpp'].append(bpp)
 
-                # Log sample images
-                if iter_valid % 100 == 0:
-                    safe_add_image(writer, 'cover/test', cover, ep)
-                    safe_add_image(writer, 'generated/test', generated, ep)
-                    safe_add_image(writer, 'payload/test', cover-generated, ep)
+            # Log sample images
+            # if iter_valid % 100 == 0:
+            #     safe_add_image(writer, 'cover/test', cover, ep)
+            #     safe_add_image(writer, 'generated/test', generated, ep)
+            #     safe_add_image(writer, 'payload/test', cover-generated, ep)
+            writer.add_image('cover/test', torch.tensor(np.abs(cover[:,0,:,:].cpu().detach().numpy()+1j*cover[:,1,:,:].cpu().detach().numpy())).unsqueeze(0), ep, dataformats='CNHW')
+            writer.add_image('generated/test', torch.tensor(np.abs(generated[:,0,:,:].cpu().detach().numpy()+1j*generated[:,1,:,:].cpu().detach().numpy())).unsqueeze(0), ep, dataformats='CNHW')
+            writer.add_image('payload/test', torch.tensor(np.abs((cover[:,0,:,:].cpu().detach().numpy()+1j*cover[:,1,:,:].cpu().detach().numpy())-(generated[:,0,:,:].cpu().detach().numpy()+1j*generated[:,1,:,:].cpu().detach().numpy()))).unsqueeze(0), ep, dataformats='CNHW')
 
         logger.info(f'encoder_mse: {encoder_mse:.3f} - decoder_loss: {decoder_loss:.3f} - decoder_acc: {decoder_acc:.3f} - '
                     f'cover_score: {cover_score:.3f} - generated_score: {generated_score:.3f} - '
@@ -285,17 +300,18 @@ if __name__ == '__main__':
         os.makedirs(dir_path, exist_ok=True)
 
     batch_size = 8
-    epochs = 20
-    learning_rate = 0.0003
+    epochs = 32
+    learning_rate = 0.0005
 
-    # Initialize models
-    data_depth = 2
-    hidden_size = 128
+    # Hyperparams
+    channels_size = 3
+    data_depth = 4
+    hidden_size = 32
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    encoder = DenseEncoder(data_depth, hidden_size).to(device)
-    decoder = DenseDecoder(data_depth, hidden_size).to(device)
-    critic = BasicCritic(hidden_size).to(device)
+    encoder = DenseEncoder(data_depth, hidden_size, channels_size).to(device)
+    decoder = DenseDecoder(data_depth, hidden_size, channels_size).to(device)
+    critic = BasicCritic(hidden_size, channels_size).to(device)
 
     # Optimizers
     cr_optimizer = Adam(critic.parameters(), lr=learning_rate)
@@ -315,7 +331,7 @@ if __name__ == '__main__':
     load_model_path = None # 'results/model/previous_model.dat' to resume training
     writer = SummaryWriter("./logs")
 
-    train_dataset = AudioDataset('datasets/processed/train', normalize=True, data_type='music')
+    train_dataset = AudioDataset('datasets/processed/train', normalize=True, data_type='speech')
 
     # Optimize DataLoader
     train_loader = DataLoader(
@@ -327,7 +343,7 @@ if __name__ == '__main__':
         persistent_workers=True,
     )
 
-    test_dataset = AudioDataset('datasets/processed/test', normalize=True, data_type='music')
+    test_dataset = AudioDataset('datasets/processed/test', normalize=True, data_type='speech')
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,

@@ -9,6 +9,8 @@ class BasicCritic(nn.Module):
     Input: STFT features (2 channels - real & imaginary) [N, 2, 360, 360]
     Output: Binary prediction (0: original, 1: steganographic) [N, 1]
     """
+    def _name(self):
+        return "BasicCritic"
 
     def _conv2d(self, in_channels, out_channels):
         """Basic convolution block without padding - reduces spatial dimensions"""
@@ -26,7 +28,7 @@ class BasicCritic(nn.Module):
         - Layer 4: Final classification
         """
         self.conv1 = nn.Sequential(
-            self._conv2d(3, self.hidden_size),
+            self._conv2d(self.channels_size, self.hidden_size),
             nn.LeakyReLU(inplace=True),
             nn.BatchNorm2d(self.hidden_size),
         )
@@ -46,14 +48,16 @@ class BasicCritic(nn.Module):
 
         return self.conv1, self.conv2, self.conv3, self.conv4
 
-    def __init__(self, hidden_size):
+    def __init__(self, hidden_size, channels_size):
         """
         Args:
             hidden_size: Number of feature channels in hidden layers
         """
         super().__init__()
         self.hidden_size = hidden_size
+        self.channels_size = channels_size
         self._models = self._build_models()
+        self.name = self._name()
 
     def forward(self, image):
         """

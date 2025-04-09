@@ -55,11 +55,11 @@ def bytearray_to_text(x):
     # print(x)
     try:
         text = rs.decode(x)
+        # print("bytearray_to_text", text)
         if isinstance(text, tuple):
             text = text[0]
-
         text = zlib.decompress(text)
         return text.decode("utf-8")
     except BaseException as e:
-        print("Error decoding message", str(e))
+        # print("Error decoding message", str(e))
         return False

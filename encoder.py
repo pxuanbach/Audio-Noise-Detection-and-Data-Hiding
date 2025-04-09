@@ -8,6 +8,8 @@ class BasicEncoder(nn.Module):
     - Input: STFT features (2 channels - real & imaginary)
     - Output: Encoded STFT with hidden data
     """
+    def _name(self):
+        return "BasicEncoder"
 
     def _conv2d(self, in_channels, out_channels):
         """Basic conv2d block with 3x3 kernel"""
@@ -21,7 +23,7 @@ class BasicEncoder(nn.Module):
     def _build_models(self):
         # First conv: 2 channels (STFT) -> hidden_size
         self.conv1 = nn.Sequential(
-            self._conv2d(3, self.hidden_size),
+            self._conv2d(self.channels_size, self.hidden_size),
             nn.LeakyReLU(inplace=True),
             nn.BatchNorm2d(self.hidden_size),
         )
@@ -40,15 +42,16 @@ class BasicEncoder(nn.Module):
         )
 
         self.conv4 = nn.Sequential(
-            self._conv2d(self.hidden_size, 3),
+            self._conv2d(self.hidden_size, self.channels_size),
         )
 
         return self.conv1, self.conv2, self.conv3, self.conv4
 
-    def __init__(self, data_depth, hidden_size):
+    def __init__(self, data_depth, hidden_size, channels_size):
         super().__init__()
         self.data_depth = data_depth
         self.hidden_size = hidden_size
+        self.channels_size = channels_size
         self._models = self._build_models()
 
     def forward(self, image, data):
@@ -60,6 +63,8 @@ class BasicEncoder(nn.Module):
 
 
 class ResidualEncoder(BasicEncoder):
+    def _name(self):
+        return "ResidualEncoder"
 
     def forward(self, image, data):
         return image + super().forward(image, data)
@@ -73,30 +78,20 @@ class DenseEncoder(ResidualEncoder):
     - Final output preserves STFT structure (2 channels)
     """
 
+    def _name(self):
+        return "DenseEncoder"
+
     def _build_models(self):
-        # Initial STFT processing
-        self.conv1 = nn.Sequential(
-            self._conv2d(3, self.hidden_size),
-            nn.LeakyReLU(inplace=True),
-            nn.BatchNorm2d(self.hidden_size),
-        )
-
-        # Dense connections: concatenate all previous features
-        self.conv2 = nn.Sequential(
-            self._conv2d(self.hidden_size + self.data_depth, self.hidden_size),
-            nn.LeakyReLU(inplace=True),
-            nn.BatchNorm2d(self.hidden_size),
-        )
-
+        self.conv1 = super()._build_models()[0]
+        self.conv2 = super()._build_models()[1]
         self.conv3 = nn.Sequential(
-            self._conv2d(self.hidden_size * 2 + self.data_depth, self.hidden_size),
+            self._conv2d(self.hidden_size * 2 +
+                         self.data_depth, self.hidden_size),
             nn.LeakyReLU(inplace=True),
             nn.BatchNorm2d(self.hidden_size),
         )
-
-        # Final conv back to 2 channels for STFT
         self.conv4 = nn.Sequential(
-            self._conv2d(self.hidden_size * 3 + self.data_depth, 3)
+            self._conv2d(self.hidden_size * 3 + self.data_depth, self.channels_size)
         )
 
         return self.conv1, self.conv2, self.conv3, self.conv4
