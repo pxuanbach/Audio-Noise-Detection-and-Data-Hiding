@@ -140,7 +140,7 @@ def train_distributed(local_rank, world_size, node_rank, nodes, master_addr, mas
         hidden_size: Hidden size for models
         weight_encoder_mse: Weight for encoder MSE loss
     """
-    setup(local_rank, world_size)
+    setup(node_rank, world_size)
 
     # Calculate global rank
     global_rank = node_rank * torch.cuda.device_count() + local_rank
