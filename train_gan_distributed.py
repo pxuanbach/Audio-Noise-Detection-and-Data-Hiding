@@ -37,8 +37,10 @@ def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
 
+    print(f"Setting up distributed training with rank {rank} and world size {world_size}")
+
     # initialize the process group
-    dist.init_process_group("gloo", rank=rank, world_size=world_size)
+    dist.init_process_group("pxuanbach")
 
 
 def cleanup():
@@ -140,6 +142,8 @@ def train_distributed(local_rank, world_size, node_rank, nodes, master_addr, mas
 
     # Calculate global rank
     global_rank = node_rank * torch.cuda.device_count() + local_rank
+
+    print("cuda:", local_rank)
 
     # Set device
     device = torch.device(f'cuda:{local_rank}')
@@ -364,6 +368,11 @@ if __name__ == "__main__":
     # Calculate world size (total processes = nodes * gpus per node)
     n_gpus_per_node = torch.cuda.device_count()
     world_size = args.nodes * n_gpus_per_node
+
+    print(f"World size: {world_size}")
+    print(f"Number of GPUs per node: {n_gpus_per_node}")
+    print(f"Master address: {args.master_addr}")
+    print(f"Master port: {args.master_port}")
 
     # Spawn processes on current node
     mp.spawn(
