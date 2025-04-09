@@ -10,7 +10,11 @@ train-master:
     --master-port 12355 \
     --batch-size 12 \
     --epochs 20 \
-    --dataset-path datasets/processed
+    --dataset-path datasets/processed \
+    --learning-rate 0.0003 \
+    --data-depth 2 \
+    --hidden-size 128 \
+    --weight-encoder-mse 100
 
 
 train-worker:
@@ -21,4 +25,8 @@ train-worker:
     --master-port 12355 \
     --batch-size 12 \
     --epochs 20 \
-    --dataset-path datasets/processed
+    --dataset-path datasets/processed \
+    --learning-rate 0.0003 \
+    --data-depth 2 \
+    --hidden-size 128 \
+    --weight-encoder-mse 100

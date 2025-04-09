@@ -32,44 +32,14 @@ logging.basicConfig(
 )
 logger = logging.getLogger(__name__)
 
-def setup_for_distributed(rank, world_size, master_addr, master_port):
-    """Initialize distributed training"""
-    os.environ['MASTER_ADDR'] = master_addr
-    os.environ['MASTER_PORT'] = str(master_port)
 
-    # Test connection to master node
-    import socket
-    try:
-        socket.create_connection((master_addr, master_port), timeout=10)
-    except:
-        raise RuntimeError(
-            f"Could not connect to master node at {master_addr}:{master_port}. "
-            "Please check:\n"
-            "1. Master node is running\n"
-            "2. IP address is correct\n"
-            "3. Port is open on master node\n"
-            "4. Firewall allows connection"
-        )
+def setup(rank, world_size):
+    os.environ['MASTER_ADDR'] = 'localhost'
+    os.environ['MASTER_PORT'] = '12355'
 
-    # Initialize process group with timeout
-    max_retries = 3
-    for i in range(max_retries):
-        try:
-            dist.init_process_group(
-                backend="nccl",
-                init_method=f"tcp://{master_addr}:{master_port}",
-                world_size=world_size,
-                rank=rank,
-                timeout=datetime.timedelta(minutes=5)
-            )
-            break
-        except Exception as e:
-            if i == max_retries - 1:
-                raise RuntimeError(f"Failed to initialize process group after {max_retries} attempts") from e
-            logger.warning(f"Attempt {i+1} failed, retrying...")
-            time.sleep(5)
+    # initialize the process group
+    dist.init_process_group("gloo", rank=rank, world_size=world_size)
 
-    logger.info(f"Successfully connected to master node and initialized process group: rank {rank}/{world_size}")
 
 def cleanup():
     """Clean up distributed training"""
@@ -146,7 +116,8 @@ def load_model(encoder, decoder, critic, en_de_optimizer, cr_optimizer, path, de
 
 def train_distributed(local_rank, world_size, node_rank, nodes, master_addr, master_port,
                      batch_size=10, epochs=10, dataset_path='datasets/processed',
-                     load_checkpoint=None):
+                     load_checkpoint=None, learning_rate=0.0002, data_depth=2,
+                     hidden_size=96, weight_encoder_mse=100):
     """
     Main training function for distributed training
     Args:
@@ -160,12 +131,15 @@ def train_distributed(local_rank, world_size, node_rank, nodes, master_addr, mas
         epochs: Number of training epochs
         dataset_path: Path to dataset (must be same on all nodes)
         load_checkpoint: Path to checkpoint file to resume training
+        learning_rate: Learning rate for optimizers
+        data_depth: Data depth for encoder/decoder
+        hidden_size: Hidden size for models
+        weight_encoder_mse: Weight for encoder MSE loss
     """
+    setup(local_rank, world_size)
+
     # Calculate global rank
     global_rank = node_rank * torch.cuda.device_count() + local_rank
-
-    # Initialize distributed process group
-    setup_for_distributed(global_rank, world_size, master_addr, master_port)
 
     # Set device
     device = torch.device(f'cuda:{local_rank}')
@@ -182,9 +156,6 @@ def train_distributed(local_rank, world_size, node_rank, nodes, master_addr, mas
     test_dataset = AudioDataset(test_path, normalize=True, data_type='music')
 
     # Initialize models
-    data_depth = 2
-    hidden_size = 96
-
     encoder = DenseEncoder(data_depth, hidden_size).to(device)
     decoder = DenseDecoder(data_depth, hidden_size).to(device)
     critic = BasicCritic(hidden_size).to(device)
@@ -195,7 +166,6 @@ def train_distributed(local_rank, world_size, node_rank, nodes, master_addr, mas
     critic = DDP(critic, device_ids=[local_rank])
 
     # Optimizers
-    learning_rate = 0.0002
     cr_optimizer = Adam(critic.parameters(), lr=learning_rate)
     en_de_optimizer = Adam(list(decoder.parameters()) + list(encoder.parameters()), lr=learning_rate)
 
@@ -229,6 +199,9 @@ def train_distributed(local_rank, world_size, node_rank, nodes, master_addr, mas
 
     # Training loop
     scaler = amp.GradScaler()
+    iter_train_critic = 0
+    iter_train_enc_dec = 0
+    iter_valid = 0
 
     for ep in range(start_epoch, epochs):
         train_loader.sampler.set_epoch(ep)
@@ -236,21 +209,120 @@ def train_distributed(local_rank, world_size, node_rank, nodes, master_addr, mas
         if global_rank == 0:
             logger.info(f"Epoch {ep+1}")
 
-        # Training steps similar to original script but with distributed considerations
+        # Train critic
         for cover, *rest in train_loader:
+            iter_train_critic += 1
+
             with amp.autocast(device_type=device.type):
                 cover = cover.to(device)
                 N, _, H, W = cover.size()
 
-                # Training logic here (similar to original script)
-                # ...
+                # Generate payload and encoded image
+                payload = torch.zeros((N, data_depth, H, W), device=device).random_(0, 2)
+                generated = encoder(cover, payload)
 
-        # Validation steps (only on rank 0)
+                # Get critic scores
+                cover_score = torch.mean(critic(cover))
+                generated_score = torch.mean(critic(generated))
+
+                # Update critic
+                cr_optimizer.zero_grad()
+                scaler.scale(cover_score - generated_score).backward(retain_graph=False)
+                scaler.step(cr_optimizer)
+                scaler.update()
+
+            # Clamp critic weights
+            with torch.no_grad():
+                for p in critic.parameters():
+                    p.data.clamp_(-0.1, 0.1)
+
+            if global_rank == 0 and writer is not None:
+                writer.add_scalar('cover_score/train', cover_score.item(), iter_train_critic)
+                writer.add_scalar('generated_score/train', generated_score.item(), iter_train_critic)
+                metrics['train.cover_score'].append(cover_score.item())
+                metrics['train.generated_score'].append(generated_score.item())
+
+        # Train encoder-decoder
+        for cover, *rest in train_loader:
+            iter_train_enc_dec += 1
+
+            with amp.autocast(device_type=device.type):
+                cover = cover.to(device)
+                N, _, H, W = cover.size()
+
+                payload = torch.zeros((N, data_depth, H, W), device=device).random_(0, 2)
+                generated = encoder(cover, payload)
+                decoded = decoder(generated)
+
+                # Calculate losses
+                encoder_mse = nn.functional.mse_loss(generated, cover)
+                decoder_ce = nn.functional.binary_cross_entropy_with_logits(decoded, payload)
+                decoder_mse = nn.functional.mse_loss(decoded, payload)
+                decoder_acc = (decoded >= 0.0).eq(payload >= 0.5).sum().float() / payload.numel()
+                generated_score = torch.mean(critic(generated))
+
+                decoder_loss = decoder_ce + 0.5 * decoder_mse - 0.1 * generated_score
+                loss = weight_encoder_mse * encoder_mse + decoder_loss
+
+                # Update encoder-decoder
+                en_de_optimizer.zero_grad()
+                scaler.scale(loss).backward()
+                scaler.step(en_de_optimizer)
+                scaler.update()
+
+            if global_rank == 0 and writer is not None:
+                writer.add_scalar('encoder_mse/train', encoder_mse.item(), iter_train_enc_dec)
+                writer.add_scalar('decoder_loss/train', decoder_loss.item(), iter_train_enc_dec)
+                writer.add_scalar('decoder_acc/train', decoder_acc.item(), iter_train_enc_dec)
+                metrics['train.encoder_mse'].append(encoder_mse.item())
+                metrics['train.decoder_loss'].append(decoder_loss.item())
+                metrics['train.decoder_acc'].append(decoder_acc.item())
+
+        # Validation (only on rank 0)
         if global_rank == 0:
-            # Validation logic here (similar to original script)
-            # ...
+            for cover, *rest in test_loader:
+                iter_valid += 1
 
-            # Save checkpoint
+                with torch.no_grad(), amp.autocast(device_type=device.type):
+                    cover = cover.to(device)
+                    N, _, H, W = cover.size()
+
+                    payload = torch.zeros((N, data_depth, H, W), device=device).random_(0, 2)
+                    generated = encoder(cover, payload)
+                    decoded = decoder(generated)
+
+                    # Calculate metrics
+                    encoder_mse = nn.functional.mse_loss(generated, cover)
+                    decoder_loss = nn.functional.binary_cross_entropy_with_logits(decoded, payload)
+                    decoder_acc = (decoded >= 0.0).eq(payload >= 0.5).sum().float() / payload.numel()
+                    generated_score = torch.mean(critic(generated))
+                    cover_score = torch.mean(critic(cover))
+
+                    ssim_val = ssim(cover, generated)
+                    psnr = 10 * torch.log10(4 / encoder_mse)
+                    bpp = data_depth * (2 * decoder_acc.item() - 1)
+
+                    if writer is not None:
+                        # Log validation metrics
+                        writer.add_scalar('encoder_mse/test', encoder_mse.item(), iter_valid)
+                        writer.add_scalar('decoder_loss/test', decoder_loss.item(), iter_valid)
+                        writer.add_scalar('decoder_acc/test', decoder_acc.item(), iter_valid)
+                        writer.add_scalar('cover_score/test', cover_score.item(), iter_valid)
+                        writer.add_scalar('generated_score/test', generated_score.item(), iter_valid)
+                        writer.add_scalar('ssim/test', ssim_val.item(), iter_valid)
+                        writer.add_scalar('psnr/test', psnr.item(), iter_valid)
+                        writer.add_scalar('bpp/test', bpp, iter_valid)
+
+                        metrics['val.encoder_mse'].append(encoder_mse.item())
+                        metrics['val.decoder_loss'].append(decoder_loss.item())
+                        metrics['val.decoder_acc'].append(decoder_acc.item())
+                        metrics['val.cover_score'].append(cover_score.item())
+                        metrics['val.generated_score'].append(generated_score.item())
+                        metrics['val.ssim'].append(ssim_val.item())
+                        metrics['val.psnr'].append(psnr.item())
+                        metrics['val.bpp'].append(bpp)
+
+            # Save checkpoint on rank 0
             save_model(encoder.module, decoder.module, critic.module,
                       en_de_optimizer, cr_optimizer, metrics, ep)
 
@@ -279,6 +351,14 @@ if __name__ == "__main__":
                        help='Timeout in seconds for node connections')
     parser.add_argument('--retry-interval', type=int, default=5,
                        help='Seconds to wait between connection retries')
+    parser.add_argument('--learning-rate', type=float, default=0.0002,
+                       help='Learning rate for optimizers')
+    parser.add_argument('--data-depth', type=int, default=2,
+                       help='Data depth for encoder/decoder')
+    parser.add_argument('--hidden-size', type=int, default=96,
+                       help='Hidden size for models')
+    parser.add_argument('--weight-encoder-mse', type=float, default=100.0,
+                       help='Weight for encoder MSE loss')
     args = parser.parse_args()
 
     # Calculate world size (total processes = nodes * gpus per node)
@@ -291,7 +371,9 @@ if __name__ == "__main__":
         args=(world_size, args.node_rank, args.nodes,
               args.master_addr, args.master_port,
               args.batch_size, args.epochs, args.dataset_path,
-              args.load_checkpoint),
+              args.load_checkpoint, args.learning_rate,
+              args.data_depth, args.hidden_size,
+              args.weight_encoder_mse),
         nprocs=n_gpus_per_node,
         join=True
     )
