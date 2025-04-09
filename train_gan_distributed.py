@@ -1,6 +1,7 @@
 import os
 import datetime
 import logging
+import time
 import torch
 import torch.nn as nn
 import torch.amp as amp
@@ -32,26 +33,43 @@ logging.basicConfig(
 logger = logging.getLogger(__name__)
 
 def setup_for_distributed(rank, world_size, master_addr, master_port):
-    """
-    Initialize distributed training
-    Args:
-        rank: Unique ID of each node (0 to world_size-1)
-        world_size: Total number of nodes
-        master_addr: IP address of master node
-        master_port: Port number for communication
-    """
+    """Initialize distributed training"""
     os.environ['MASTER_ADDR'] = master_addr
     os.environ['MASTER_PORT'] = str(master_port)
 
-    # Initialize process group
-    dist.init_process_group(
-        backend="nccl", # Use NCCL backend for GPU training
-        init_method=f"tcp://{master_addr}:{master_port}",
-        world_size=world_size,
-        rank=rank
-    )
+    # Test connection to master node
+    import socket
+    try:
+        socket.create_connection((master_addr, master_port), timeout=10)
+    except:
+        raise RuntimeError(
+            f"Could not connect to master node at {master_addr}:{master_port}. "
+            "Please check:\n"
+            "1. Master node is running\n"
+            "2. IP address is correct\n"
+            "3. Port is open on master node\n"
+            "4. Firewall allows connection"
+        )
 
-    logger.info(f"Initialized process group: rank {rank}/{world_size}")
+    # Initialize process group with timeout
+    max_retries = 3
+    for i in range(max_retries):
+        try:
+            dist.init_process_group(
+                backend="nccl",
+                init_method=f"tcp://{master_addr}:{master_port}",
+                world_size=world_size,
+                rank=rank,
+                timeout=datetime.timedelta(minutes=5)
+            )
+            break
+        except Exception as e:
+            if i == max_retries - 1:
+                raise RuntimeError(f"Failed to initialize process group after {max_retries} attempts") from e
+            logger.warning(f"Attempt {i+1} failed, retrying...")
+            time.sleep(5)
+
+    logger.info(f"Successfully connected to master node and initialized process group: rank {rank}/{world_size}")
 
 def cleanup():
     """Clean up distributed training"""
@@ -257,6 +275,10 @@ if __name__ == "__main__":
                         help='Path to dataset directory')
     parser.add_argument('--load-checkpoint', type=str, default=None,
                        help='Path to checkpoint file to resume training')
+    parser.add_argument('--timeout', type=int, default=300,
+                       help='Timeout in seconds for node connections')
+    parser.add_argument('--retry-interval', type=int, default=5,
+                       help='Seconds to wait between connection retries')
     args = parser.parse_args()
 
     # Calculate world size (total processes = nodes * gpus per node)
