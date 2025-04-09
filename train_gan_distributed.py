@@ -42,7 +42,7 @@ def setup(rank, world_size):
     print(f"Setting up distributed training with rank {rank} and world size {world_size}")
 
     # initialize the process group
-    dist.init_process_group("nccl")
+    dist.init_process_group("nccl", rank=rank, world_size=world_size, init_method='file:///tmp/distributed_training')
 
 
 def cleanup():

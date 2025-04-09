@@ -30,3 +30,7 @@ train-worker:
     --data-depth 2 \
     --hidden-size 128 \
     --weight-encoder-mse 100
+
+
+# test-env:
+    # python -c "import torch; print(torch.__version__, torch.cuda.is_available(), torch.distributed.is_nccl_available())"
