@@ -36,11 +36,13 @@ logger = logging.getLogger(__name__)
 def setup(rank, world_size):
     os.environ['MASTER_ADDR'] = 'localhost'
     os.environ['MASTER_PORT'] = '12355'
+    os.environ['RANK'] = str(rank)
+    os.environ['WORLD_SIZE'] = str(world_size)
 
     print(f"Setting up distributed training with rank {rank} and world size {world_size}")
 
     # initialize the process group
-    dist.init_process_group("pxuanbach")
+    dist.init_process_group("nccl")
 
 
 def cleanup():
