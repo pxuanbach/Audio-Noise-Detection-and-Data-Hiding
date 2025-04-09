@@ -5,24 +5,27 @@ import numpy as np
 from pathlib import Path
 
 class AudioDataset(Dataset):
-    def __init__(self, data_dir, normalize=True, cache_size=100):
+    def __init__(self, data_dir, normalize=True, cache_size=100, data_type='both'):
         self.data_dir = Path(data_dir)
-
-        # Load all data files
         self.features = []
         self.labels = []
 
-        # Process speech files (label 0)
-        speech_files = list((self.data_dir / 'speech').glob('*.npy'))
-        for file in speech_files:
-            self.features.append(np.load(str(file)))
-            self.labels.append(0)
+        if data_type in ['both', 'speech']:
+            # Process speech files (label 0)
+            speech_files = list((self.data_dir / 'speech').glob('*.npy'))
+            for file in speech_files:
+                self.features.append(np.load(str(file)))
+                self.labels.append(0)
 
-        # Process music files (label 1)
-        music_files = list((self.data_dir / 'music').glob('*.npy'))
-        for file in music_files:
-            self.features.append(np.load(str(file)))
-            self.labels.append(1)
+        if data_type in ['both', 'music']:
+            # Process music files (label 1)
+            music_files = list((self.data_dir / 'music').glob('*.npy'))
+            for file in music_files:
+                self.features.append(np.load(str(file)))
+                self.labels.append(1)
+
+        if len(self.features) == 0:
+            raise ValueError(f"No data found for data_type '{data_type}'. Use 'speech', 'music', or 'both'")
 
         # Convert to numpy arrays
         self.features = np.array(self.features)  # Shape: [N, 2, 360, 360]

@@ -184,13 +184,17 @@ def fit_gan(encoder, decoder, critic, en_de_optimizer, cr_optimizer, metrics, tr
 
                 # Calculate losses
                 encoder_mse = nn.functional.mse_loss(generated, cover)
-                decoder_loss = nn.functional.binary_cross_entropy_with_logits(decoded, payload)
+                decoder_ce = nn.functional.binary_cross_entropy_with_logits(decoded, payload)
+                decoder_mse = nn.functional.mse_loss(decoded, payload)
                 decoder_acc = (decoded >= 0.0).eq(payload >= 0.5).sum().float() / payload.numel()
                 generated_score = torch.mean(critic(generated))
 
+                # Hybrid loss for decoder
+                decoder_loss = decoder_ce + 0.5 * decoder_mse - 0.1 * generated_score
+
                 # Update encoder-decoder
                 en_de_optimizer.zero_grad()
-                loss = 100 * encoder_mse + decoder_loss + generated_score
+                loss = 100 * encoder_mse + decoder_loss
                 scaler.scale(loss).backward()
                 scaler.step(en_de_optimizer)
                 scaler.update()
@@ -280,13 +284,13 @@ if __name__ == '__main__':
     for dir_path in ['results', 'results/model', 'results/plots']:
         os.makedirs(dir_path, exist_ok=True)
 
-    batch_size = 12
-    epochs = 10
-    learning_rate = 1e-4
+    batch_size = 8
+    epochs = 20
+    learning_rate = 0.0003
 
     # Initialize models
-    data_depth = 1
-    hidden_size = 64
+    data_depth = 2
+    hidden_size = 128
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     encoder = DenseEncoder(data_depth, hidden_size).to(device)
@@ -311,7 +315,7 @@ if __name__ == '__main__':
     load_model_path = None # 'results/model/previous_model.dat' to resume training
     writer = SummaryWriter("./logs")
 
-    train_dataset = AudioDataset('datasets/processed/train', normalize=True)
+    train_dataset = AudioDataset('datasets/processed/train', normalize=True, data_type='music')
 
     # Optimize DataLoader
     train_loader = DataLoader(
@@ -323,12 +327,12 @@ if __name__ == '__main__':
         persistent_workers=True,
     )
 
-    test_dataset = AudioDataset('datasets/processed/test', normalize=True)
+    test_dataset = AudioDataset('datasets/processed/test', normalize=True, data_type='music')
     test_loader = DataLoader(
         test_dataset,
         batch_size=batch_size,
         shuffle=False,
-        num_workers=4,
+        num_workers=2,
         pin_memory=True,
         persistent_workers=True,
     )
