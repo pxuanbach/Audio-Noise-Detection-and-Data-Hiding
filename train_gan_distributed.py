@@ -162,24 +162,20 @@ def train_distributed(local_rank, world_size, node_rank, nodes, master_addr, mas
     test_dataset = AudioDataset(test_path, normalize=True, data_type='music')
 
     # Initialize models
-    print(f"Initializing models")
     encoder = DenseEncoder(data_depth, hidden_size).to(device)
     decoder = DenseDecoder(data_depth, hidden_size).to(device)
     critic = BasicCritic(hidden_size).to(device)
 
     # Wrap models with DDP
-    print(f"Wrapping models with DDP")
     encoder = DDP(encoder, device_ids=[local_rank])
     decoder = DDP(decoder, device_ids=[local_rank])
     critic = DDP(critic, device_ids=[local_rank])
 
     # Optimizers
-    print(f"Initializing optimizers")
     cr_optimizer = Adam(critic.parameters(), lr=learning_rate)
     en_de_optimizer = Adam(list(decoder.parameters()) + list(encoder.parameters()), lr=learning_rate)
 
     # Initialize datasets and dataloaders
-    print(f"Initializing dataloaders")
     train_loader = get_data_loader(train_dataset, batch_size, global_rank, world_size)
     test_loader = get_data_loader(test_dataset, batch_size, global_rank, world_size)
 
@@ -189,7 +185,6 @@ def train_distributed(local_rank, world_size, node_rank, nodes, master_addr, mas
         writer = SummaryWriter(f"./logs/distributed")
 
     # Load checkpoint if specified
-    print(f"Loading checkpoint if specified")
     if load_checkpoint and os.path.exists(load_checkpoint):
         metrics, start_epoch, date = load_model(
             encoder, decoder, critic,
@@ -215,14 +210,12 @@ def train_distributed(local_rank, world_size, node_rank, nodes, master_addr, mas
     iter_valid = 0
 
     for ep in range(start_epoch, epochs):
-        print(f"Epoch {ep+1}/{epochs}")
         train_loader.sampler.set_epoch(ep)
 
         if global_rank == 0:
             logger.info(f"Epoch {ep+1}")
 
         # Train critic
-        print(f"Training critic")
         for cover, *rest in train_loader:
             iter_train_critic += 1
 
@@ -256,7 +249,6 @@ def train_distributed(local_rank, world_size, node_rank, nodes, master_addr, mas
                 metrics['train.generated_score'].append(generated_score.item())
 
         # Train encoder-decoder
-        print(f"Training encoder-decoder")
         for cover, *rest in train_loader:
             iter_train_enc_dec += 1
 
@@ -293,7 +285,6 @@ def train_distributed(local_rank, world_size, node_rank, nodes, master_addr, mas
                 metrics['train.decoder_acc'].append(decoder_acc.item())
 
         # Validation (only on rank 0)
-        print(f"Validating")
         if global_rank == 0:
             for cover, *rest in test_loader:
                 iter_valid += 1
