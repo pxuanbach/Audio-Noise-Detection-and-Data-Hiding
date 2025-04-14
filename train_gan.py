@@ -10,11 +10,14 @@ from tqdm import tqdm
 import datetime
 import os
 import gc
-from datasets.audio_dataset import AudioDataset
+from torchvision import transforms
+# from datasets.audio_dataset import AudioDataset
+from datasets import AudioToImageFolder
 from encoder import DenseEncoder
 from decoder import DenseDecoder
 from critic import BasicCritic
 from utils import ssim
+from utils.audio_to_stft import audio_to_stft
 
 # Set up logging configuration
 logging.basicConfig(
@@ -299,14 +302,22 @@ if __name__ == '__main__':
     for dir_path in ['results', 'results/model', 'results/plots']:
         os.makedirs(dir_path, exist_ok=True)
 
-    batch_size = 8
-    epochs = 32
-    learning_rate = 0.0005
+    config = {
+        'batch_size': 8,
+        'epochs': 32,
+        'learning_rate': 0.0005,
+        'channels_size': 2,
+        'data_depth': 4,
+        'hidden_size': 32,
+    }
 
-    # Hyperparams
-    channels_size = 3
-    data_depth = 4
-    hidden_size = 32
+    data_depth = config['data_depth']
+    hidden_size = config['hidden_size']
+    channels_size = config['channels_size']
+    batch_size = config['batch_size']
+    epochs = config['epochs']
+    learning_rate = config['learning_rate']
+
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
     encoder = DenseEncoder(data_depth, hidden_size, channels_size).to(device)
@@ -331,30 +342,44 @@ if __name__ == '__main__':
     load_model_path = None # 'results/model/previous_model.dat' to resume training
     writer = SummaryWriter("./logs")
 
-    train_dataset = AudioDataset('datasets/processed/train', normalize=True, data_type='speech')
+    # train_dataset = AudioDataset('datasets/processed/train', normalize=True, data_type='speech')
 
-    # Optimize DataLoader
-    train_loader = DataLoader(
-        train_dataset,
-        batch_size=batch_size,
-        shuffle=True,
-        num_workers=4,  # Increase num_workers based on CPU cores
-        pin_memory=True,
-        persistent_workers=True,
-    )
+    # # Optimize DataLoader
+    # train_loader = DataLoader(
+    #     train_dataset,
+    #     batch_size=batch_size,
+    #     shuffle=True,
+    #     num_workers=4,  # Increase num_workers based on CPU cores
+    #     pin_memory=True,
+    #     persistent_workers=True,
+    # )
 
-    test_dataset = AudioDataset('datasets/processed/test', normalize=True, data_type='speech')
-    test_loader = DataLoader(
-        test_dataset,
-        batch_size=batch_size,
-        shuffle=False,
-        num_workers=2,
-        pin_memory=True,
-        persistent_workers=True,
-    )
+    # test_dataset = AudioDataset('datasets/processed/test', normalize=True, data_type='speech')
+    # test_loader = DataLoader(
+    #     test_dataset,
+    #     batch_size=batch_size,
+    #     shuffle=False,
+    #     num_workers=2,
+    #     pin_memory=True,
+    #     persistent_workers=True,
+    # )
 
-    # Clear CUDA cache before training
-    torch.cuda.empty_cache()
+    # # Clear CUDA cache before training
+    # torch.cuda.empty_cache()
+
+
+    #region new dataset machanism
+    data_dir="D:/Backup/FSDKaggle2018"
+    transform = transforms.Compose([transforms.Lambda(lambda wav: audio_to_stft(wav))])
+    train_set = AudioToImageFolder(data_dir, transform=transform)
+    part_train_set = torch.utils.data.random_split(train_set, [800, len(train_set)-800])[0]
+    train_loader = torch.utils.data.DataLoader(part_train_set, batch_size=4, shuffle=True,)
+
+    test_set = AudioToImageFolder(data_dir, transform=transform)
+    part_test_set = torch.utils.data.random_split(test_set, [100, len(test_set)-100])[0]
+    test_loader = torch.utils.data.DataLoader(part_test_set, batch_size=4, shuffle=True)
+    #endregion
+
 
     # Start training
     fit_gan(encoder, decoder, critic, en_de_optimizer, cr_optimizer, metrics,

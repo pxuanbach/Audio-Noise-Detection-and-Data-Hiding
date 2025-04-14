@@ -53,6 +53,7 @@ class BasicEncoder(nn.Module):
         self.hidden_size = hidden_size
         self.channels_size = channels_size
         self._models = self._build_models()
+        self.name = self._name()
 
     def forward(self, image, data):
         x = self._models[0](image)

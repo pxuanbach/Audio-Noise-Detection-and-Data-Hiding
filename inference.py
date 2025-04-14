@@ -2,7 +2,9 @@ import json
 import torch
 import torch.nn as nn
 import torch.nn.functional as F
+import torchaudio
 from critic import BasicCritic
+from datasets import AudioToImageFolder
 from encoder import DenseEncoder
 from decoder import DenseDecoder
 from utils.audio_to_stft import audio_to_stft, stft_to_audio
@@ -90,162 +92,103 @@ def process_audio(audio_path, normalize=True):
 
     return cover, (sr, n_fft, hop_length)
 
-def test_hiding(encoder, decoder, audio_path, message, data_depth, device='cuda', save_audio=True):
+def make_payload(width, height, depth, text):
+    """
+    This takes a piece of text and encodes it into a bit vector. It then
+    fills a matrix of size (width, height) with copies of the bit vector.
+    """
+    message = text_to_bits(text) + [0] * 32
+
+    payload = message
+    while len(payload) < width * height * depth:
+        payload += message
+
+    payload = payload[:width * height * depth]
+
+    return torch.FloatTensor(payload).view(1, depth, height, width)
+
+
+
+def test_audio(encoder, decoder, cover, payload):
+    generated = encoder.forward(cover, payload)
+    decoded = decoder.forward(generated)
+    decoder_loss = torch.nn.functional.binary_cross_entropy_with_logits(decoded, payload)
+    decoder_acc = (decoded >= 0.0).eq(
+        payload >= 0.5).sum().float() / payload.numel() # .numel() calculate the number of element in a tensor
+    print("Decoder loss: %.3f"% decoder_loss.item())
+    print("Decoder acc: %.3f"% decoder_acc.item())
+    f, ax = plt.subplots(1, 3,figsize=(16,5))
+    f.suptitle("%s_%s"%(encoder.name,decoder.name), fontsize=16)
+    f.tight_layout(pad=4.0)
+    if len(cover.shape)==4:
+        cover_=cover.squeeze(0).cpu().detach().numpy()
+    else:
+        cover_=cover.cpu().detach().numpy()
+    cover_spec=cover_[0]+1j*cover_[1]
+    librosa.display.specshow(cover_spec, x_axis='time', fmin=0,fmax=22050,
+                            y_axis='mel', sr=22050, ax=ax[0])
+    ax[0].set_title('Cover image')
+    if len(generated.shape)==4:
+        generated_=generated.squeeze(0).cpu().detach().numpy()
+    else:
+        generated_=generated.cpu().detach().numpy()
+    generated_spec=generated_[0]+1j*generated_[1]
+    librosa.display.specshow(generated_spec, x_axis='time', fmin=0,fmax=22050,
+                            y_axis='mel', sr=22050, ax=ax[1])
+    ax[1].set_title('Generated image')
+    payload_=cover_spec-generated_spec
+    img=librosa.display.specshow(payload_, x_axis='time', y_axis='mel', fmin=0,fmax=22050,
+                            sr=22050, ax=ax[2])
+    ax[2].set_title('Generated payload')
+
+    return generated
+
+
+def make_message(image):
+    image = image.to(device)
+
+    image = decoder(image).view(-1) > 0
+    image = torch.tensor(image, dtype=torch.uint8)
+
+    # split and decode messages
+    candidates = Counter()
+    bits = image.data.cpu().numpy().tolist()
+    for candidate in bits_to_bytearray(bits).split(b'\x00\x00\x00\x00'):
+      #print(candidate)
+      candidate = bytearray_to_text(bytearray(candidate))
+      if candidate:
+          candidates[candidate] += 1
+
+    # choose most common message
+    if len(candidates) == 0:
+      raise ValueError('Failed to find message.')
+
+    candidate, count = candidates.most_common(1)[0]
+    return candidate
+
+
+
+def test_hiding(encoder, decoder, test_set_item, message, data_depth, device='cuda'):
     """Test hiding text message in audio file"""
     # Load and process audio
-    cover, (sr, n_fft, hop_length) = process_audio(audio_path)
-    cover = cover.to(device)
-
-    # Convert message to binary with error correction
-    message_bits = text_to_bits(message) + [0] * 32
-    message_len = len(message_bits)
-    print(f"Message bits:", message_bits[:32])
-    print(f"Message length in bits: {message_len}")
+    # cover, (sr, n_fft, hop_length) = process_audio(audio_path)
+    cover, path, hop_length = test_set_item
 
     # Calculate capacity
-    N, C, H, W = cover.size()
+    _, H, W = cover.size()
+    cover = cover[None].to(device)
+
     total_bits = H * W * data_depth
     print(f"Maximum capacity in bits: {total_bits}")
 
-    if message_len > total_bits:
-        raise ValueError(f"Message too long! Max bits: {total_bits}, Message bits: {message_len}")
-
-    payload_bits = message_bits
-    while len(payload_bits) < W * H * data_depth:
-        payload_bits += message_bits
-
-    payload_bits = payload_bits[:W * H * data_depth]
-
-    # Reshape payload to match training format
-    payload = torch.FloatTensor(payload_bits).view(1, data_depth, H, W)
+    payload = make_payload(W, H, data_depth, message)
     payload = payload.to(device)
 
-    # Generate marked audio
-    # with torch.no_grad():
-    generated = encoder.forward(cover, payload)
+    generated = test_audio(encoder, decoder, cover, payload)
 
-    # Save generated audio if requested
-    if save_audio:
-        # Create output directory if needed
-        os.makedirs('output', exist_ok=True)
+    text_return_ = make_message(generated)
 
-        # Get real and imaginary components from generated spectrogram
-        generated_numpy = generated.cpu().squeeze().numpy() # (3, 360, 360)
-        print(f"Generated shape: {generated_numpy.shape}")
-        # Convert to audio using only real and imaginary components
-        generated_stft = generated_numpy[:2]  # Only real and imaginary parts (2, 360, 360)
-        audio_signal = stft_to_audio(
-            generated_stft,
-            hop_length=hop_length
-        )
-
-        output_path = os.path.join('output', 'marked_audio.wav')
-        sf.write(output_path, audio_signal, sr)
-        print(f"\nSaved marked audio to: {output_path}")
-
-    decoded = decoder.forward(generated)
-
-    # print("\nDecoder raw output (logits):")
-    # print(decoded)
-
-    # Calculate mean loss across all elements
-    decoder_loss = torch.nn.functional.binary_cross_entropy_with_logits(decoded, payload)
-    decoder_acc = (decoded >= 0.0).eq(payload >= 0.5).sum().float() / payload.numel()
-
-    print(f"Decoder loss: {decoder_loss.item():.3f}")
-    print(f"Decoder accuracy: {decoder_acc.item():.3f}")
-
-    # # decoded = decoded[:, :, 1:, :]
-    # # Apply threshold to decoded bits
-    # decoded_bits = (decoded > 0).int()
-
-    # # print(f"Decoded bits: {decoded_bits}")
-
-    # decoded_bits_str = ''.join(map(str, decoded_bits.flatten().tolist()))
-    # decoded_bits_str = decoded_bits_str[:message_len]
-
-    # print(f"Decoded bits: {decoded_bits_str[:32]}")
-
-    # # Compare original and decoded bits
-    # compare_bits(str(message_bits), decoded_bits_str)
-
-    # # Try decoding message
-    # decoded_message = bits_to_text(decoded_bits_str)
-    # print(f"\nOriginal message: {message}")
-    # print(f"Decoded message: {decoded_message}")
-
-    generated = generated.to(device)
-    decoded = decoder(generated).view(-1) > 0
-    decoded = torch.tensor(decoded, dtype=torch.uint8)
-
-    candidates = Counter()
-    bits = decoded.data.cpu().numpy().tolist()
-    print(f"Decoded bits: {bits[:32]}")
-    for candidate in bits_to_bytearray(bits).split(b'\x00\x00\x00\x00'):
-
-        if candidate in [bytearray(b''), bytearray(b' ')]:
-            continue
-
-        candidate = bytearray_to_text(bytearray(candidate))
-        if candidate:
-            candidates[candidate] += 1
-
-    if len(candidates) == 0:
-        print("No candidates found")
-        return
-
-    candidate, count = candidates.most_common(1)[0]
-    print(f"Decoded message: {candidate}")
-
-    # Visualize results
-    # fig = plt.figure(figsize=(15, 10))
-
-    # # Original spectrograms
-    # ax1 = plt.subplot(2, 2, 1)
-    # real_db_orig = librosa.amplitude_to_db(np.abs(cover.cpu().detach().squeeze()[0]), ref=np.max)
-    # img1 = librosa.display.specshow(real_db_orig,
-    #                               y_axis='linear',
-    #                               x_axis='time',
-    #                               ax=ax1,
-    #                               cmap='magma')
-    # ax1.set_title('Original Real Part')
-    # fig.colorbar(img1, ax=ax1, format="%+2.f dB")
-
-    # ax2 = plt.subplot(2, 2, 2)
-    # imag_db_orig = librosa.amplitude_to_db(np.abs(cover.cpu().detach().squeeze()[1]), ref=np.max)
-    # img2 = librosa.display.specshow(imag_db_orig,
-    #                               y_axis='linear',
-    #                               x_axis='time',
-    #                               ax=ax2,
-    #                               cmap='magma')
-    # ax2.set_title('Original Imaginary Part')
-    # fig.colorbar(img2, ax=ax2, format="%+2.f dB")
-
-    # # Marked spectrograms
-    # ax3 = plt.subplot(2, 2, 3)
-    # real_db_marked = librosa.amplitude_to_db(np.abs(generated.cpu().detach().squeeze()[0]), ref=np.max)
-    # img3 = librosa.display.specshow(real_db_marked,
-    #                               y_axis='linear',
-    #                               x_axis='time',
-    #                               ax=ax3,
-    #                               cmap='magma')
-    # ax3.set_title('Marked Real Part')
-    # fig.colorbar(img3, ax=ax3, format="%+2.f dB")
-
-    # ax4 = plt.subplot(2, 2, 4)
-    # imag_db_marked = librosa.amplitude_to_db(np.abs(generated.cpu().detach().squeeze()[1]), ref=np.max)
-    # img4 = librosa.display.specshow(imag_db_marked,
-    #                               y_axis='linear',
-    #                               x_axis='time',
-    #                               ax=ax4,
-    #                               cmap='magma')
-    # ax4.set_title('Marked Imaginary Part')
-    # fig.colorbar(img4, ax=ax4, format="%+2.f dB")
-
-    # fig.suptitle('Spectrogram Comparison: Original vs Marked')
-    # plt.tight_layout()
-    # plt.savefig('marked_spectrogram.png', dpi=300, bbox_inches='tight')
-    # plt.show()
+    print('Message found: ', text_return_)
 
 
 if __name__ == '__main__':
@@ -254,8 +197,8 @@ if __name__ == '__main__':
     # model_path = 'models/DenseEncoder_DenseDecoder_0.962_2025-04-05_22h46m42.dat'
     # model_path = 'models/DenseEncoder_DenseDecoder_0.964_2025-04-05_22h22m10.dat'
     # model_path = 'models/DenseEncoder_DenseDecoder_0.915_2025-04-09_12h08m20.dat'
-    model_path = 'models/DenseEncoder_DenseDecoder_0.832_2025-04-10_00h32m49.dat'
-    channels_size = 3
+    model_path = 'models/DenseEncoder_DenseDecoder_0.850_2025-04-13_13h29m40.dat'
+    channels_size = 2
     data_depth = 4
     hidden_size = 32
     save_audio = False
@@ -269,10 +212,13 @@ if __name__ == '__main__':
         device=device
     )
 
-    # Test with text message
-    audio_path = "D:\\Backup\\musan\\speech\\librivox\\speech-librivox-0003.wav"
-    # audio_path = "D:\\Backup\\musan\\speech\\us-gov\\speech-us-gov-0003.wav"
-    # audio_path = "D:\\Backup\\musan\\music\\jamendo\\music-jamendo-0000.wav"
-    message = "hello"
+    message = "kakak kakak"
 
-    marked_spectrogram = test_hiding(encoder, decoder, audio_path, message, data_depth, device, save_audio)
+    data_dir="D:/Backup/FSDKaggle2018"
+    from torchvision import transforms
+    transform = transforms.Compose([transforms.Lambda(lambda wav: audio_to_stft(wav))])
+    test_set = AudioToImageFolder(data_dir, transform=transform)
+    part_test_set = torch.utils.data.random_split(test_set, [100, len(test_set)-100])[0]
+    test_loader = torch.utils.data.DataLoader(part_test_set, batch_size=4, shuffle=True)
+
+    marked_spectrogram = test_hiding(encoder, decoder, test_set[101], message, data_depth, device)
