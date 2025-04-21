@@ -15,7 +15,7 @@ from torchvision import transforms
 from datasets import AudioToImageFolder
 from encoder import DenseEncoder
 from decoder import DenseDecoder
-from critic import BasicCritic
+from critic import BasicCritic, ImprovedCritic
 from utils import ssim
 from utils.audio_to_stft import audio_to_stft
 
@@ -58,6 +58,7 @@ def save_model(encoder, decoder, critic, en_de_optimizer, cr_optimizer, metrics,
     now = datetime.datetime.now()
     cover_score = metrics['val.decoder_acc'][-1]
     name = f"{encoder.__class__.__name__}_{decoder.__class__.__name__}_{cover_score:.3f}_{now.strftime('%Y-%m-%d_%Hh%Mm%S')}.dat"
+    os.makedirs(save_dir, exist_ok=True)
     fname = os.path.join(save_dir, name)
 
     states = {
@@ -89,7 +90,7 @@ def load_model(encoder, decoder, critic, en_de_optimizer, cr_optimizer, path):
 
 
 def fit_gan(encoder, decoder, critic, en_de_optimizer, cr_optimizer, metrics, train_loader, valid_loader,
-           epochs=32, device: torch.device = torch.device('cpu'), load_model_path=None, writer=None):
+           epochs=32, device: torch.device = torch.device('cpu'), load_model_path=None, writer=None, save_dir='models'):
     """Train the GAN model
 
     Args:
@@ -289,7 +290,7 @@ def fit_gan(encoder, decoder, critic, en_de_optimizer, cr_optimizer, metrics, tr
                     f'ssim: {ssim_val:.3f} - psnr: {psnr:.3f} - bpp: {bpp:.3f}')
 
         # Save checkpoint
-        save_model(encoder, decoder, critic, en_de_optimizer, cr_optimizer, metrics, ep)
+        save_model(encoder, decoder, critic, en_de_optimizer, cr_optimizer, metrics, ep, save_dir)
 
     # Add model graphs to tensorboard
     writer.add_graph(encoder, (cover, payload))
@@ -298,16 +299,12 @@ def fit_gan(encoder, decoder, critic, en_de_optimizer, cr_optimizer, metrics, tr
     writer.close()
 
 if __name__ == '__main__':
-    # Create directories
-    for dir_path in ['results', 'results/model', 'results/plots']:
-        os.makedirs(dir_path, exist_ok=True)
-
     config = {
         'batch_size': 8,
-        'epochs': 32,
-        'learning_rate': 0.0005,
+        'epochs': 36,
+        'learning_rate': 0.0006,
         'channels_size': 2,
-        'data_depth': 4,
+        'data_depth': 2,
         'hidden_size': 32,
     }
 
@@ -323,6 +320,7 @@ if __name__ == '__main__':
     encoder = DenseEncoder(data_depth, hidden_size, channels_size).to(device)
     decoder = DenseDecoder(data_depth, hidden_size, channels_size).to(device)
     critic = BasicCritic(hidden_size, channels_size).to(device)
+    # critic = ImprovedCritic(hidden_size, channels_size).to(device)
 
     # Optimizers
     cr_optimizer = Adam(critic.parameters(), lr=learning_rate)
@@ -373,7 +371,7 @@ if __name__ == '__main__':
     transform = transforms.Compose([transforms.Lambda(lambda wav: audio_to_stft(wav))])
     train_set = AudioToImageFolder(data_dir, transform=transform)
     part_train_set = torch.utils.data.random_split(train_set, [800, len(train_set)-800])[0]
-    train_loader = torch.utils.data.DataLoader(part_train_set, batch_size=4, shuffle=True,)
+    train_loader = torch.utils.data.DataLoader(part_train_set, batch_size=batch_size, shuffle=True,)
 
     test_set = AudioToImageFolder(data_dir, transform=transform)
     part_test_set = torch.utils.data.random_split(test_set, [100, len(test_set)-100])[0]
@@ -383,5 +381,7 @@ if __name__ == '__main__':
 
     # Start training
     fit_gan(encoder, decoder, critic, en_de_optimizer, cr_optimizer, metrics,
-            train_loader, test_loader, epochs=epochs, device=device,
-            load_model_path=load_model_path, writer=writer)
+        train_loader, test_loader, epochs=epochs, device=device,
+        load_model_path=load_model_path, writer=writer,
+        save_dir=f"models/{hidden_size}_{channels_size}_{data_depth}_{epochs}"
+    )

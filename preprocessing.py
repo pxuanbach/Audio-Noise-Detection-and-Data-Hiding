@@ -1,148 +1,91 @@
 import os
+import random
+import logging
+import soundfile as sf
 import numpy as np
+from pathlib import Path
 from tqdm import tqdm
 
-from utils.audio_to_stft import audio_to_stft
-import json
+# Global configurations
+MAX_SEGMENTS_PER_FILE = 5
+MIN_DURATION = 0.3  # seconds
+MAX_DURATION = 30.0  # seconds
+OUTPUT_DIR = Path("datasets/processed")
+MUSAN_DIR = Path("D:/Backup/musan")  # Change this to your MUSAN dataset path
 
-# Project and data paths
-CURRENT_DIR = os.path.dirname(os.path.abspath(__file__))
-PROCESSED_DIR = os.path.join(CURRENT_DIR, "datasets", "processed")
-MUSAN_ROOT = "D:\Backup\musan"  # Keep this absolute since it's external data source
+# Set up logging
+logging.basicConfig(
+    level=logging.INFO,
+    format='%(asctime)s - %(levelname)s - %(message)s'
+)
+logger = logging.getLogger(__name__)
 
-# Parameters for STFT (360, 360)
-SAMPLE_RATE = 22000  # Standard audio rate
-N_FFT = 719         # Will give ~360 frequency bins
-MAX_DURATION = 10.0  # Duration in seconds
-TRAIN_RATIO = 0.8
-TARGET_FRAMES = 360
-TARGET_FREQ_BINS = 360
-TRAIN_MAX_SEGMENTS = 5
-TEST_MAX_SEGMENTS = 5
+def create_random_segments(audio, sr, min_duration=MIN_DURATION, max_duration=MAX_DURATION, max_segments=MAX_SEGMENTS_PER_FILE):
+    """Create random segments from an audio file"""
+    audio_duration = len(audio) / sr
+    segments = []
 
-# Data augmentation parameters
-AUGMENTATION = {
-    'time_stretch': [0.9, 1.1],  # Range for time stretching
-    'pitch_shift': [-2, 2],      # Semitones for pitch shifting
-    'noise_level': [0.001, 0.002]  # Background noise level range
-}
+    if audio_duration < min_duration:
+        return segments
 
-def preprocess_musan_dataset_stft(root_dir, output_dir=PROCESSED_DIR):
-    """Process MUSAN dataset with augmentation"""
-    # Create main directories
-    if not os.path.exists(output_dir):
-        os.makedirs(output_dir)
+    # Adjust max_duration if audio is shorter
+    max_duration = min(max_duration, audio_duration)
 
-    # Create train and test subdirectories
-    train_dir = os.path.join(output_dir, "train")
-    test_dir = os.path.join(output_dir, "test")
+    # Calculate number of segments for this file
+    num_segments = random.randint(1, max_segments)
 
-    for split_dir in [train_dir, test_dir]:
-        for category in ["speech", "music"]:
-            os.makedirs(os.path.join(split_dir, category), exist_ok=True)
+    for _ in range(num_segments):
+        # Random duration between min and max
+        segment_duration = random.uniform(min_duration, max_duration)
+        segment_samples = int(segment_duration * sr)
 
-    # Process each category
-    for category in ["speech", "music"]:
-        category_path = os.path.join(root_dir, category)
-        if not os.path.exists(category_path):
-            print(f"Directory {category_path} does not exist!")
+        # Random start point
+        max_start = len(audio) - segment_samples
+        if max_start <= 0:
             continue
 
-        # Get all wav files
-        wav_files = []
-        for root, _, files in os.walk(category_path):
-            wav_files.extend([os.path.join(root, f) for f in files if f.endswith('.wav')])
+        start_idx = random.randint(0, max_start)
+        segment = audio[start_idx:start_idx + segment_samples]
 
-        # Shuffle files
-        np.random.seed(42)  # For reproducibility
-        np.random.shuffle(wav_files)
+        segments.append((segment, sr))
 
-        # Split into train and test
-        n_train = int(len(wav_files) * TRAIN_RATIO)
-        train_files = wav_files[:n_train]
-        test_files = wav_files[n_train:]
+    return segments
 
-        # Process train files with augmentation
-        with tqdm(total=len(train_files), desc=f"Processing {category} train files") as pbar:
-            for file_path in train_files:
-                file_name = os.path.splitext(os.path.basename(file_path))[0]
+def process_directory(input_dir, output_dir, category):
+    """Process all audio files in a directory"""
+    input_dir = Path(input_dir)
+    output_dir = Path(output_dir) / category
+    output_dir.mkdir(parents=True, exist_ok=True)
 
-                # Process audio
-                stft_segments, sr, n_fft, hop_length = audio_to_stft(
-                    file_path,
-                    sr=SAMPLE_RATE,
-                    n_fft=N_FFT,
-                    segment_len_sec=MAX_DURATION,
-                    target_frames=TARGET_FRAMES,
-                    target_freq_bins=TARGET_FREQ_BINS,
-                    max_segments=TRAIN_MAX_SEGMENTS
-                )
+    audio_files = list(input_dir.rglob("*.wav"))
+    logger.info(f"Found {len(audio_files)} files in {category} directory")
 
-                # Save each segment
-                for i, stft_spec in enumerate(stft_segments):
-                    output_file = os.path.join(train_dir, category, f"{file_name}_seg{i}.npy")
-                    np.save(output_file, stft_spec)
-                pbar.update(1)
+    for audio_path in tqdm(audio_files, desc=f"Processing {category}"):
+        try:
+            # Read audio file
+            audio, sr = sf.read(str(audio_path))
 
-            # Save STFT parameters to JSON file
-            params = {
-                'sample_rate': sr,
-                'n_fft': n_fft,
-                'max_duration': MAX_DURATION,
-                'target_frames': TARGET_FRAMES,
-                'target_freq_bins': TARGET_FREQ_BINS,
-                'max_segments': TRAIN_MAX_SEGMENTS,
-                'hop_length': hop_length,
-            }
+            # Create segments
+            segments = create_random_segments(audio, sr)
 
-            # Save parameters
-            params_file = os.path.join(train_dir, 'stft_params.json')
-            if not os.path.exists(params_file):
-                with open(params_file, 'w') as f:
-                    json.dump(params, f, indent=4)
+            # Save segments
+            for i, (segment, sr) in enumerate(segments):
+                output_name = f"{audio_path.stem}_seg{i}.wav"
+                output_path = output_dir / output_name
+                sf.write(str(output_path), segment, sr)
 
+        except Exception as e:
+            logger.error(f"Error processing {audio_path}: {str(e)}")
 
-        # Process test files
-        with tqdm(total=len(test_files), desc=f"Processing {category} test files") as pbar:
-            for file_path in test_files:
-                file_name = os.path.splitext(os.path.basename(file_path))[0]
-                stft_segments, sr, n_fft, hop_length = audio_to_stft(
-                    file_path,
-                    sr=SAMPLE_RATE,
-                    n_fft=N_FFT,
-                    segment_len_sec=MAX_DURATION,
-                    target_frames=TARGET_FRAMES,
-                    target_freq_bins=TARGET_FREQ_BINS,
-                    max_segments=TEST_MAX_SEGMENTS
-                )
-                # Save first segment only for test files
-                if len(stft_segments) > 0:
-                    output_file = os.path.join(test_dir, category, f"{file_name}.npy")
-                    np.save(output_file, stft_segments[0])
-                pbar.update(1)
+def main():
+    # Create output directories
+    logger.info("Starting audio preprocessing...")
 
-            # Save STFT parameters to JSON file
-            params = {
-                'sample_rate': sr,
-                'n_fft': n_fft,
-                'max_duration': MAX_DURATION,
-                'target_frames': TARGET_FRAMES,
-                'target_freq_bins': TARGET_FREQ_BINS,
-                'max_segments': TEST_MAX_SEGMENTS,
-                'hop_length': hop_length,
-            }
+    # Process speech and music directories
+    process_directory(MUSAN_DIR / "speech", OUTPUT_DIR, "speech")
+    process_directory(MUSAN_DIR / "music", OUTPUT_DIR, "music")
 
-            # Save parameters
-            params_file = os.path.join(test_dir, 'stft_params.json')
-            if not os.path.exists(params_file):
-                with open(params_file, 'w') as f:
-                    json.dump(params, f, indent=4)
-
-
-    print(f"\nData split completed:")
-    print(f"Train data saved to: {train_dir}")
-    print(f"Test data saved to: {test_dir}")
+    logger.info("Preprocessing completed!")
 
 if __name__ == "__main__":
-    # Process and split dataset
-    preprocess_musan_dataset_stft(MUSAN_ROOT)
+    main()
