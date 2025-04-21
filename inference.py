@@ -197,9 +197,11 @@ if __name__ == '__main__':
     # model_path = 'models/DenseEncoder_DenseDecoder_0.962_2025-04-05_22h46m42.dat'
     # model_path = 'models/DenseEncoder_DenseDecoder_0.964_2025-04-05_22h22m10.dat'
     # model_path = 'models/DenseEncoder_DenseDecoder_0.915_2025-04-09_12h08m20.dat'
-    model_path = 'models/DenseEncoder_DenseDecoder_0.850_2025-04-13_13h29m40.dat'
+    model_path = 'models\\gan_32_2_2_epochs_32\\DenseEncoder_DenseDecoder_0.966_2025-04-21_16h21m37.dat' #0.921
+    # model_path = 'models\\gan_32_2_2_epochs_32\\DenseEncoder_DenseDecoder_0.961_2025-04-21_16h01m26.dat' #0.901
+    # model_path = 'models\\gan_32_2_2_epochs_32\\DenseEncoder_DenseDecoder_0.956_2025-04-21_15h49m44.dat' #0.900 OK
     channels_size = 2
-    data_depth = 4
+    data_depth = 2
     hidden_size = 32
     save_audio = False
 
@@ -212,7 +214,10 @@ if __name__ == '__main__':
         device=device
     )
 
-    message = "kakak kakak"
+    message = "a"
+    # message = "ka ka ka"
+    # message = "This is secret message. It is very important to keep it secret"
+    # message = "kasdjmaokasoddajio82isda9ajsd9asdkakalasdonma9a732jasc8ajnajsd9asdkasdkj aaaaaaaaaakasdjasjdjasd"
 
     data_dir="D:/Backup/FSDKaggle2018"
     from torchvision import transforms
