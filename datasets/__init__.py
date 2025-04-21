@@ -1,6 +1,7 @@
 import os
 
 from torchvision import datasets, transforms
+from torch.utils.data import Dataset
 import torchaudio
 
 
@@ -56,3 +57,31 @@ class AudioToImageFolder(datasets.DatasetFolder):
             target = self.target_transform(target)
 
         return sample, path, hop_length
+
+class SingleAudioLoader(Dataset):
+    """Loader cho 1 file WAV duy nhất, có cấu trúc giống AudioToImageFolder."""
+
+    def __init__(self, file_path, transform=None, target_transform=None, loader=wav_loader):
+        self.file_path = file_path
+        self.transform = transform
+        self.target_transform = target_transform
+        self.loader = loader
+
+        # Load WAV
+        self.sample = self.loader(self.file_path)
+
+    def __getitem__(self, index):
+        sample = self.sample
+
+        hop_length = None
+        if self.transform is not None:
+            transformed = self.transform(sample)
+            if isinstance(transformed, tuple) and len(transformed) == 2:
+                sample, hop_length = transformed
+            else:
+                sample = transformed
+
+        return sample, self.file_path, hop_length
+
+    def __len__(self):
+        return 1

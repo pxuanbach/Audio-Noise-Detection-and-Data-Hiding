@@ -4,7 +4,7 @@ import torch.nn as nn
 import torch.nn.functional as F
 import torchaudio
 from critic import BasicCritic
-from datasets import AudioToImageFolder
+from datasets import AudioToImageFolder, SingleAudioLoader
 from encoder import DenseEncoder
 from decoder import DenseDecoder
 from utils.audio_to_stft import audio_to_stft, stft_to_audio
@@ -109,37 +109,109 @@ def make_payload(width, height, depth, text):
 
 
 
-def test_audio(encoder, decoder, cover, payload):
+# def test_audio(encoder, decoder, cover, payload):
+#     generated = encoder.forward(cover, payload)
+#     decoded = decoder.forward(generated)
+#     decoder_loss = torch.nn.functional.binary_cross_entropy_with_logits(decoded, payload)
+#     decoder_acc = (decoded >= 0.0).eq(
+#         payload >= 0.5).sum().float() / payload.numel() # .numel() calculate the number of element in a tensor
+#     print("Decoder loss: %.3f"% decoder_loss.item())
+#     print("Decoder acc: %.3f"% decoder_acc.item())
+#     f, ax = plt.subplots(1, 3,figsize=(16,5))
+#     f.suptitle("%s_%s"%(encoder.name,decoder.name), fontsize=16)
+#     f.tight_layout(pad=4.0)
+#     if len(cover.shape)==4:
+#         cover_=cover.squeeze(0).cpu().detach().numpy()
+#     else:
+#         cover_=cover.cpu().detach().numpy()
+#     cover_spec=cover_[0]+1j*cover_[1]
+#     cover_mag = np.abs(cover_spec)
+#     librosa.display.specshow(cover_mag, x_axis='time', fmin=0,fmax=22050, y_axis='mel', sr=22050, ax=ax[0])
+#     ax[0].set_title('Cover image')
+#     if len(generated.shape)==4:
+#         generated_=generated.squeeze(0).cpu().detach().numpy()
+#     else:
+#         generated_=generated.cpu().detach().numpy()
+#     generated_spec=generated_[0]+1j*generated_[1]
+#     # librosa.display.specshow(generated_spec, x_axis='time', fmin=0,fmax=22050, y_axis='mel', sr=22050, ax=ax[1])
+#     # ax[1].set_title('Generated image')
+#     generated_mag = np.abs(generated_spec)
+
+#     # Rồi truyền vào specshow
+#     librosa.display.specshow(generated_mag, x_axis='time', fmin=0, fmax=22050,
+#                             y_axis='mel', sr=22050, ax=ax[1])
+#     ax[1].set_title('Generated image')
+
+#     payload_=cover_spec-generated_spec
+#     payload_mag = np.abs(payload_)
+#     img=librosa.display.specshow(payload_mag, x_axis='time', y_axis='mel', fmin=0,fmax=22050, sr=22050, ax=ax[2])
+#     ax[2].set_title('Generated payload')
+
+#     return generated
+def test_audio(encoder, decoder, cover, payload, save_wav=True):
     generated = encoder.forward(cover, payload)
     decoded = decoder.forward(generated)
+
     decoder_loss = torch.nn.functional.binary_cross_entropy_with_logits(decoded, payload)
-    decoder_acc = (decoded >= 0.0).eq(
-        payload >= 0.5).sum().float() / payload.numel() # .numel() calculate the number of element in a tensor
-    print("Decoder loss: %.3f"% decoder_loss.item())
-    print("Decoder acc: %.3f"% decoder_acc.item())
-    f, ax = plt.subplots(1, 3,figsize=(16,5))
-    f.suptitle("%s_%s"%(encoder.name,decoder.name), fontsize=16)
+    decoder_acc = (decoded >= 0.0).eq(payload >= 0.5).sum().float() / payload.numel()
+
+    print("Decoder loss: %.3f" % decoder_loss.item())
+    print("Decoder acc: %.3f" % decoder_acc.item())
+
+    f, ax = plt.subplots(1, 3, figsize=(16, 5))
+    f.suptitle("%s_%s" % (encoder.name, decoder.name), fontsize=16)
     f.tight_layout(pad=4.0)
-    if len(cover.shape)==4:
-        cover_=cover.squeeze(0).cpu().detach().numpy()
-    else:
-        cover_=cover.cpu().detach().numpy()
-    cover_spec=cover_[0]+1j*cover_[1]
-    librosa.display.specshow(cover_spec, x_axis='time', fmin=0,fmax=22050,
-                            y_axis='mel', sr=22050, ax=ax[0])
-    ax[0].set_title('Cover image')
-    if len(generated.shape)==4:
-        generated_=generated.squeeze(0).cpu().detach().numpy()
-    else:
-        generated_=generated.cpu().detach().numpy()
-    generated_spec=generated_[0]+1j*generated_[1]
-    librosa.display.specshow(generated_spec, x_axis='time', fmin=0,fmax=22050,
-                            y_axis='mel', sr=22050, ax=ax[1])
-    ax[1].set_title('Generated image')
-    payload_=cover_spec-generated_spec
-    img=librosa.display.specshow(payload_, x_axis='time', y_axis='mel', fmin=0,fmax=22050,
-                            sr=22050, ax=ax[2])
-    ax[2].set_title('Generated payload')
+
+    def extract_complex_spec(tensor):
+        if len(tensor.shape) == 4:
+            tensor = tensor.squeeze(0)
+        tensor = tensor.cpu().detach().numpy()
+        complex_spec = tensor[0] + 1j * tensor[1]
+        return complex_spec
+
+    cover_spec = extract_complex_spec(cover)
+    generated_spec = extract_complex_spec(generated)
+
+    # Magnitudes (for display)
+    cover_mag = np.abs(cover_spec)
+    generated_mag = np.abs(generated_spec)
+
+    # Plot Cover
+    librosa.display.specshow(librosa.power_to_db(cover_mag ** 2, ref=np.max),
+                             x_axis='time', y_axis='mel', fmin=0, fmax=22050,
+                             sr=22050, ax=ax[0])
+    ax[0].set_title('Cover Image')
+
+    # Plot Generated
+    librosa.display.specshow(librosa.power_to_db(generated_mag ** 2, ref=np.max),
+                             x_axis='time', y_axis='mel', fmin=0, fmax=22050,
+                             sr=22050, ax=ax[1])
+    ax[1].set_title('Generated Image')
+
+    # Plot Payload diff
+    diff = cover_mag - generated_mag
+    librosa.display.specshow(diff, x_axis='time', y_axis='mel', fmin=0, fmax=22050,
+                             sr=22050, ax=ax[2])
+    ax[2].set_title('Payload (Difference)')
+
+    plt.show()
+
+    if save_wav:
+        # Chuyển từ Mel spectrogram → linear spectrogram → waveform
+        # Giả định bạn có mel → STFT hoặc dùng Griffin-Lim để tái tạo sóng âm
+        sr = 22050  # hoặc thay bằng sr thật nếu khác
+
+        print("Converting and saving WAV files...")
+
+        # Dùng Griffin-Lim để tạo lại waveform từ magnitude spectrogram
+        cover_wave = librosa.griffinlim(cover_mag, n_iter=60)
+        generated_wave = librosa.griffinlim(generated_mag, n_iter=60)
+
+        # Ghi file .wav
+        sf.write("cover_reconstructed.wav", cover_wave, sr)
+        sf.write("generated_reconstructed.wav", generated_wave, sr)
+
+        print("Saved: cover_reconstructed.wav & generated_reconstructed.wav")
 
     return generated
 
@@ -214,16 +286,20 @@ if __name__ == '__main__':
         device=device
     )
 
-    message = "a"
-    # message = "ka ka ka"
+    # message = "a"
+    message = "ka ka ka"
     # message = "This is secret message. It is very important to keep it secret"
     # message = "kasdjmaokasoddajio82isda9ajsd9asdkakalasdonma9a732jasc8ajnajsd9asdkasdkj aaaaaaaaaakasdjasjdjasd"
 
-    data_dir="D:/Backup/FSDKaggle2018"
+    # data_dir="D:/Backup/FSDKaggle2018"
+    data_dir="C:/Users/Admin/Documents/GitHub/Steganography_GANs/audio/train"
+    file_dir="C:/Users/Admin/Documents/GitHub/Steganography_GANs/audio/train/_/00c82919.wav"
     from torchvision import transforms
     transform = transforms.Compose([transforms.Lambda(lambda wav: audio_to_stft(wav))])
     test_set = AudioToImageFolder(data_dir, transform=transform)
     part_test_set = torch.utils.data.random_split(test_set, [100, len(test_set)-100])[0]
     test_loader = torch.utils.data.DataLoader(part_test_set, batch_size=4, shuffle=True)
+    test_single = SingleAudioLoader(file_dir, transform=transform)
+    print(test_set[101])
 
-    marked_spectrogram = test_hiding(encoder, decoder, test_set[101], message, data_depth, device)
+    marked_spectrogram = test_hiding(encoder, decoder, test_single[0], message, data_depth, device)
