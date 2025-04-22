@@ -148,7 +148,73 @@ def make_payload(width, height, depth, text):
 #     ax[2].set_title('Generated payload')
 
 #     return generated
-def test_audio(encoder, decoder, cover, payload, save_wav=True):
+# def test_audio(encoder, decoder, cover, payload, hop_length, save_wav=True):
+#     generated = encoder.forward(cover, payload)
+#     decoded = decoder.forward(generated)
+
+#     decoder_loss = torch.nn.functional.binary_cross_entropy_with_logits(decoded, payload)
+#     decoder_acc = (decoded >= 0.0).eq(payload >= 0.5).sum().float() / payload.numel()
+
+#     print("Decoder loss: %.3f" % decoder_loss.item())
+#     print("Decoder acc: %.3f" % decoder_acc.item())
+
+#     f, ax = plt.subplots(1, 3, figsize=(16, 5))
+#     f.suptitle("%s_%s" % (encoder.name, decoder.name), fontsize=16)
+#     f.tight_layout(pad=4.0)
+
+#     def extract_complex_spec(tensor):
+#         if len(tensor.shape) == 4:
+#             tensor = tensor.squeeze(0)
+#         tensor = tensor.cpu().detach().numpy()
+#         complex_spec = tensor[0] + 1j * tensor[1]
+#         return complex_spec
+
+#     cover_spec = extract_complex_spec(cover)
+#     generated_spec = extract_complex_spec(generated)
+
+#     # Magnitudes (for display)
+#     cover_mag = np.abs(cover_spec)
+#     generated_mag = np.abs(generated_spec)
+
+#     # Plot Cover
+#     librosa.display.specshow(librosa.power_to_db(cover_mag ** 2, ref=np.max),
+#                              x_axis='time', y_axis='mel', fmin=0, fmax=22050,
+#                              sr=22050, ax=ax[0])
+#     ax[0].set_title('Cover Image')
+
+#     # Plot Generated
+#     librosa.display.specshow(librosa.power_to_db(generated_mag ** 2, ref=np.max),
+#                              x_axis='time', y_axis='mel', fmin=0, fmax=22050,
+#                              sr=22050, ax=ax[1])
+#     ax[1].set_title('Generated Image')
+
+#     # Plot Payload diff
+#     diff = cover_mag - generated_mag
+#     librosa.display.specshow(diff, x_axis='time', y_axis='mel', fmin=0, fmax=22050,
+#                              sr=22050, ax=ax[2])
+#     ax[2].set_title('Payload (Difference)')
+
+#     plt.show()
+
+#     if save_wav:
+#         # Chuyển từ Mel spectrogram → linear spectrogram → waveform
+#         # Giả định bạn có mel → STFT hoặc dùng Griffin-Lim để tái tạo sóng âm
+#         sr = 22050  # hoặc thay bằng sr thật nếu khác
+
+#         print("Converting and saving WAV files...")
+
+#         # Dùng Griffin-Lim để tạo lại waveform từ magnitude spectrogram
+#         cover_wave = librosa.griffinlim(cover_mag, n_iter=60)
+#         generated_wave = librosa.griffinlim(generated_mag, n_iter=60)
+
+#         # Ghi file .wav
+#         sf.write("cover_reconstructed.wav", cover_wave, sr)
+#         sf.write("generated_reconstructed.wav", generated_wave, sr)
+
+#         print("Saved: cover_reconstructed.wav & generated_reconstructed.wav")
+
+#     return generated
+def test_audio(encoder, decoder, cover, payload, save_wav=True, sr=22050, hop_length=512, n_fft=1024):
     generated = encoder.forward(cover, payload)
     decoded = decoder.forward(generated)
 
@@ -177,44 +243,38 @@ def test_audio(encoder, decoder, cover, payload, save_wav=True):
     generated_mag = np.abs(generated_spec)
 
     # Plot Cover
-    librosa.display.specshow(librosa.power_to_db(cover_mag ** 2, ref=np.max),
-                             x_axis='time', y_axis='mel', fmin=0, fmax=22050,
-                             sr=22050, ax=ax[0])
+    librosa.display.specshow(librosa.amplitude_to_db(cover_mag, ref=np.max),
+                             x_axis='time', y_axis='linear',
+                             sr=sr, hop_length=hop_length, ax=ax[0])
     ax[0].set_title('Cover Image')
 
     # Plot Generated
-    librosa.display.specshow(librosa.power_to_db(generated_mag ** 2, ref=np.max),
-                             x_axis='time', y_axis='mel', fmin=0, fmax=22050,
-                             sr=22050, ax=ax[1])
+    librosa.display.specshow(librosa.amplitude_to_db(generated_mag, ref=np.max),
+                             x_axis='time', y_axis='linear',
+                             sr=sr, hop_length=hop_length, ax=ax[1])
     ax[1].set_title('Generated Image')
 
     # Plot Payload diff
     diff = cover_mag - generated_mag
-    librosa.display.specshow(diff, x_axis='time', y_axis='mel', fmin=0, fmax=22050,
-                             sr=22050, ax=ax[2])
+    librosa.display.specshow(diff, x_axis='time', y_axis='linear',
+                             sr=sr, hop_length=hop_length, ax=ax[2])
     ax[2].set_title('Payload (Difference)')
 
     plt.show()
 
     if save_wav:
-        # Chuyển từ Mel spectrogram → linear spectrogram → waveform
-        # Giả định bạn có mel → STFT hoặc dùng Griffin-Lim để tái tạo sóng âm
-        sr = 22050  # hoặc thay bằng sr thật nếu khác
-
         print("Converting and saving WAV files...")
 
-        # Dùng Griffin-Lim để tạo lại waveform từ magnitude spectrogram
-        cover_wave = librosa.griffinlim(cover_mag, n_iter=60)
-        generated_wave = librosa.griffinlim(generated_mag, n_iter=60)
+        # Dùng Griffin-Lim để tái tạo waveform
+        cover_wave = librosa.griffinlim(cover_mag, n_iter=60, hop_length=hop_length, n_fft=n_fft)
+        generated_wave = librosa.griffinlim(generated_mag, n_iter=60, hop_length=hop_length, n_fft=n_fft)
 
-        # Ghi file .wav
         sf.write("cover_reconstructed.wav", cover_wave, sr)
         sf.write("generated_reconstructed.wav", generated_wave, sr)
 
         print("Saved: cover_reconstructed.wav & generated_reconstructed.wav")
 
     return generated
-
 
 def make_message(image):
     image = image.to(device)
@@ -240,11 +300,36 @@ def make_message(image):
 
 
 
+# def test_hiding(encoder, decoder, test_set_item, message, data_depth, device='cuda'):
+#     """Test hiding text message in audio file"""
+#     # Load and process audio
+#     # cover, (sr, n_fft, hop_length) = process_audio(audio_path)
+#     cover, path, hop_length = test_set_item
+#     print(hop_length)
+
+#     # Calculate capacity
+#     _, H, W = cover.size()
+#     cover = cover[None].to(device)
+
+#     total_bits = H * W * data_depth
+#     print(f"Maximum capacity in bits: {total_bits}")
+
+#     payload = make_payload(W, H, data_depth, message)
+#     payload = payload.to(device)
+
+#     generated = test_audio(encoder, decoder, cover, payload, hop_length)
+
+#     text_return_ = make_message(generated)
+
+#     print('Message found: ', text_return_)
+
 def test_hiding(encoder, decoder, test_set_item, message, data_depth, device='cuda'):
     """Test hiding text message in audio file"""
-    # Load and process audio
-    # cover, (sr, n_fft, hop_length) = process_audio(audio_path)
-    cover, path, hop_length = test_set_item
+    
+    # unpack thông tin đúng định dạng mới
+    cover, path, info = test_set_item
+    sr, hop_length, n_fft = info
+    print(f"Sample rate: {sr}, Hop length: {hop_length}, FFT: {n_fft}")
 
     # Calculate capacity
     _, H, W = cover.size()
@@ -256,7 +341,9 @@ def test_hiding(encoder, decoder, test_set_item, message, data_depth, device='cu
     payload = make_payload(W, H, data_depth, message)
     payload = payload.to(device)
 
-    generated = test_audio(encoder, decoder, cover, payload)
+    # Pass thêm các tham số để tái tạo waveform chính xác hơn
+    generated = test_audio(encoder, decoder, cover, payload,
+                           save_wav=True, sr=sr, hop_length=hop_length, n_fft=n_fft)
 
     text_return_ = make_message(generated)
 
@@ -293,13 +380,13 @@ if __name__ == '__main__':
 
     # data_dir="D:/Backup/FSDKaggle2018"
     data_dir="C:/Users/Admin/Documents/GitHub/Steganography_GANs/audio/train"
-    file_dir="C:/Users/Admin/Documents/GitHub/Steganography_GANs/audio/train/_/00c82919.wav"
+    file_dir="C:/Users/Admin/Documents/GitHub/Steganography_GANs/audio/train/_/00c934d7.wav"
     from torchvision import transforms
     transform = transforms.Compose([transforms.Lambda(lambda wav: audio_to_stft(wav))])
     test_set = AudioToImageFolder(data_dir, transform=transform)
     part_test_set = torch.utils.data.random_split(test_set, [100, len(test_set)-100])[0]
     test_loader = torch.utils.data.DataLoader(part_test_set, batch_size=4, shuffle=True)
     test_single = SingleAudioLoader(file_dir, transform=transform)
-    print(test_set[101])
+    
 
     marked_spectrogram = test_hiding(encoder, decoder, test_single[0], message, data_depth, device)

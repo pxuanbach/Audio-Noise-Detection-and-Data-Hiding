@@ -59,7 +59,7 @@ class AudioToImageFolder(datasets.DatasetFolder):
         return sample, path, hop_length
 
 class SingleAudioLoader(Dataset):
-    """Loader cho 1 file WAV duy nhất, có cấu trúc giống AudioToImageFolder."""
+    """Loader cho 1 file WAV duy nhất, trả về cả spectrogram và thông số."""
 
     def __init__(self, file_path, transform=None, target_transform=None, loader=wav_loader):
         self.file_path = file_path
@@ -73,15 +73,19 @@ class SingleAudioLoader(Dataset):
     def __getitem__(self, index):
         sample = self.sample
 
-        hop_length = None
+        # Mặc định thông số nếu không có transform custom trả ra
+        sr, hop_length, n_fft = 22050, 256, 1024
+
         if self.transform is not None:
             transformed = self.transform(sample)
             if isinstance(transformed, tuple) and len(transformed) == 2:
-                sample, hop_length = transformed
+                sample, params = transformed
+                if isinstance(params, (tuple, list)) and len(params) == 3:
+                    sr, hop_length, n_fft = params
             else:
-                sample = transformed
+                sample = transformed  # fallback nếu transform không trả ra param
 
-        return sample, self.file_path, hop_length
+        return sample, self.file_path, (sr, hop_length, n_fft)
 
     def __len__(self):
         return 1
