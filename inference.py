@@ -264,13 +264,17 @@ def test_audio(encoder, decoder, cover, payload, save_wav=True, sr=22050, hop_le
 
     if save_wav:
         print("Converting and saving WAV files...")
+        cover_spec=cover.squeeze(0).cpu().detach().numpy()
+        cover_rec=cover_spec[0]+1j*cover_spec[1]
+        
+        generated_spec=generated.squeeze(0).cpu().detach().numpy()
+        generated_rec=generated_spec[0]+1j*generated_spec[1]
+        
+        cover_wave = librosa.istft(cover_rec, hop_length=hop_length)
+        generated_wave = librosa.istft(generated_rec, hop_length=hop_length)
 
-        # Dùng Griffin-Lim để tái tạo waveform
-        cover_wave = librosa.griffinlim(cover_mag, n_iter=60, hop_length=hop_length, n_fft=n_fft)
-        generated_wave = librosa.griffinlim(generated_mag, n_iter=60, hop_length=hop_length, n_fft=n_fft)
-
-        sf.write("cover_reconstructed.wav", cover_wave, sr)
-        sf.write("generated_reconstructed.wav", generated_wave, sr)
+        sf.write("cover_reconstructed.wav", cover_wave, 22050*2)
+        sf.write("generated_reconstructed.wav", generated_wave, 22050*2)
 
         print("Saved: cover_reconstructed.wav & generated_reconstructed.wav")
 
