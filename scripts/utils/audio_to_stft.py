@@ -86,7 +86,7 @@ def compute_hop_length(segment_len, n_fft, target_frames):
 #     return segments, sr, n_fft, hop_length
 
 
-def audio_to_stft(audio_wav, target_frames=360, sr=22050):
+def audio_to_stft(audio_wav, target_frames=360):
     audio_wav = audio_wav[0]
     audio_length = audio_wav.shape[0]
     hop_length = int(audio_length / (target_frames - 1))
@@ -115,7 +115,8 @@ def audio_to_stft(audio_wav, target_frames=360, sr=22050):
             order=1
         )
 
-    return torch.tensor([mel_real, mel_imag]).float(), (sr, hop_length, n_fft)
+    return torch.tensor([mel_real, mel_imag]).float(), hop_length, n_fft
+
 
 
 def stft_to_audio(stft_array, hop_length):

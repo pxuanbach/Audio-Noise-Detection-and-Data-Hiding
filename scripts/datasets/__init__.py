@@ -73,19 +73,15 @@ class SingleAudioLoader(Dataset):
     def __getitem__(self, index):
         sample = self.sample
 
-        # Mặc định thông số nếu không có transform custom trả ra
-        sr, hop_length, n_fft = 22050, 256, 1024
-
         if self.transform is not None:
-            transformed = self.transform(sample)
-            if isinstance(transformed, tuple) and len(transformed) == 2:
-                sample, params = transformed
-                if isinstance(params, (tuple, list)) and len(params) == 3:
-                    sr, hop_length, n_fft = params
-            else:
-                sample = transformed  # fallback nếu transform không trả ra param
+            sample = self.transform(sample)
+            hop_length = sample[1]
+            sample = sample[0]
 
-        return sample, self.file_path, (sr, hop_length, n_fft)
+        if self.target_transform is not None:
+            target = self.target_transform(target)
+
+        return sample, self.file_path, hop_length
 
     def __len__(self):
         return 1

@@ -24,7 +24,7 @@ export async function POST(req: NextRequest) {
   return await new Promise((resolve) => {
     const py = spawn(
       'python',
-      [path.join(process.cwd(), 'scripts', 'decode_script.py'), inputPath],
+      [path.join(process.cwd(), 'scripts', 'decode_audio.py'), inputPath],
       {
         env: {
           ...process.env,
