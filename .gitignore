@@ -180,3 +180,6 @@ mlruns/
 data/
 urbansound8k/
 datasets/processed/
+
+node_modules/
+jspm_packages/
