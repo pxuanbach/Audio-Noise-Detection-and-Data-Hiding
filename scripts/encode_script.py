@@ -403,13 +403,13 @@ if __name__ == '__main__':
     # message = "kasdjmaokasoddajio82isda9ajsd9asdkakalasdonma9a732jasc8ajnajsd9asdkasdkj aaaaaaaaaakasdjasjdjasd"
 
     # data_dir="D:/Backup/FSDKaggle2018"
-    data_dir="C:/Users/Admin/Documents/GitHub/Steganography_GANs/audio/train"
+    # data_dir="C:/Users/Admin/Documents/GitHub/Steganography_GANs/audio/train"
     file_dir=input_path
     from torchvision import transforms
     transform = transforms.Compose([transforms.Lambda(lambda wav: audio_to_stft(wav))])
-    test_set = AudioToImageFolder(data_dir, transform=transform)
-    part_test_set = torch.utils.data.random_split(test_set, [100, len(test_set)-100])[0]
-    test_loader = torch.utils.data.DataLoader(part_test_set, batch_size=4, shuffle=True)
+    # test_set = AudioToImageFolder(data_dir, transform=transform)
+    # part_test_set = torch.utils.data.random_split(test_set, [100, len(test_set)-100])[0]
+    # test_loader = torch.utils.data.DataLoader(part_test_set, batch_size=4, shuffle=True)
     test_single = SingleAudioLoader(file_dir, transform=transform)
     
 
