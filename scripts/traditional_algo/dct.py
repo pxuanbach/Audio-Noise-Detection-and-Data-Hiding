@@ -11,21 +11,13 @@ def denormalize_audio(normalized_data, original_max):
     """Restore audio data to original value range"""
     return (normalized_data * original_max).astype(np.int16)
 
-def embed_message(audio_path, message, output_path, block_size=1024, alpha=0.1):
-    """
-    Embed message into audio file using DCT
-    :param audio_path: Path to original audio file
-    :param message: Message string to hide
-    :param output_path: Path to output audio file
-    :param block_size: DCT block size
-    :param alpha: Embedding strength coefficient
-    """
-    # Read audio file
+def embed_message(audio_path, message, output_path, block_size=512, alpha=0.1):
     sample_rate, audio_data = wavfile.read(audio_path)
 
     # Convert message to bit string
     message_bits = ''.join([format(ord(c), '08b') for c in message])
     bits_length = len(message_bits)
+    print(f"Message length in bits: {bits_length}")
 
     # Normalize audio data
     original_max = np.max(np.abs(audio_data))
@@ -40,7 +32,7 @@ def embed_message(audio_path, message, output_path, block_size=1024, alpha=0.1):
     for i in range(num_blocks):
         block = normalized_audio[i*block_size:(i+1)*block_size]
 
-        # Perform DCT
+        # DCT
         dct_block = dct(block, type=2, norm='ortho')
 
         # Embed bit if there's still message to embed
@@ -51,7 +43,7 @@ def embed_message(audio_path, message, output_path, block_size=1024, alpha=0.1):
             else:
                 dct_block[1] = -(abs(dct_block[1]) + alpha)
 
-        # Perform IDCT
+        # IDCT
         normalized_audio[i*block_size:(i+1)*block_size] = idct(dct_block, type=2, norm='ortho')
 
     # Restore to original value range
@@ -60,7 +52,7 @@ def embed_message(audio_path, message, output_path, block_size=1024, alpha=0.1):
     # Save audio file
     wavfile.write(output_path, sample_rate, stego_audio)
 
-def extract_message(stego_path, message_length, block_size=1024):
+def extract_message(stego_path, message_length, block_size=512):
     """
     Extract message from audio file
     :param stego_path: Path to audio file containing hidden message
@@ -68,7 +60,6 @@ def extract_message(stego_path, message_length, block_size=1024):
     :param block_size: DCT block size
     :return: Hidden message
     """
-    # Read audio file
     sample_rate, stego_audio = wavfile.read(stego_path)
 
     # Normalize data
@@ -91,10 +82,14 @@ def extract_message(stego_path, message_length, block_size=1024):
 
     return message
 
-# Example usage
+
 if __name__ == "__main__":
-    audio_path = "D:/Backup/musan/music/fma-western-art/music-fma-wa-0000.wav"
-    secret_message = "Xin chao TAKA21"
+    # audio_path = "D:/Backup/musan/music/fma-western-art/music-fma-wa-0000.wav"
+    # audio_path = "D:/Backup/FSDKaggle2018/test/0bb807c0.wav"
+    # audio_path = "D:/Backup/FSDKaggle2018/test/6e32975d.wav"
+    # audio_path = "D:/Backup/FSDKaggle2018/test/0db65bf4.wav"
+    audio_path = "D:/Backup/FSDKaggle2018/test/008afd93.wav"
+    secret_message = "Xin chao TAKA27 ohio"
     output_path = "scripts/traditional_algo/stego_dct.wav"
 
     # Embed message
