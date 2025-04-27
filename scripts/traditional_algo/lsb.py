@@ -8,9 +8,8 @@ def message_to_bin(message):
     binary_message = ''.join(format(byte, '08b') for byte in message.encode('utf-8'))
     return binary_message
 
-def embed_audio(stego_audio_path, secret_message, cover_audio_path):
+def embed_message(stego_audio_path: str, secret_message: str, cover_audio_path: str):
     """Embed the secret message into the cover audio."""
-    # Load audio file
     rate, samples = wavfile.read(cover_audio_path)
 
     # Ensure samples are in int16 format
@@ -18,6 +17,7 @@ def embed_audio(stego_audio_path, secret_message, cover_audio_path):
 
     # Convert secret message to binary
     binary_message = message_to_bin(secret_message) + DELIMITER
+    print(f"Binary message length: {len(message_to_bin(secret_message))}")
 
     # Check if the audio can contain the secret message
     if len(binary_message) > len(samples):
@@ -27,12 +27,11 @@ def embed_audio(stego_audio_path, secret_message, cover_audio_path):
     for i, bit in enumerate(binary_message):
         samples[i] = (samples[i] & ~1) | int(bit)
 
-    # Save the stego audio
     wavfile.write(stego_audio_path, rate, samples)
+    print(f"Stego audio saved at: {stego_audio_path}")
 
-def extract_audio(stego_audio_path):
+def extract_message(stego_audio_path):
     """Extract the secret message from the stego audio."""
-    # Load stego audio file
     rate, samples = wavfile.read(stego_audio_path)
 
     # Ensure samples are in int16 format
@@ -54,11 +53,14 @@ def extract_audio(stego_audio_path):
 
 if __name__ == "__main__":
     # Example Usage
-    cover_audio_path = "D:/Backup/musan/music/fma-western-art/music-fma-wa-0000.wav"
+    cover_audio_path = "D:/Backup/FSDKaggle2018/test/0bb807c0.wav"
+    # cover_audio_path = "D:/Backup/FSDKaggle2018/test/6e32975d.wav"
+    # cover_audio_path = "D:/Backup/FSDKaggle2018/test/0db65bf4.wav"
+    # cover_audio_path = "D:/Backup/FSDKaggle2018/test/008afd93.wav"
     stego_audio_path = "scripts/traditional_algo/stego_lsb.wav"
-    secret_message = "Hello TAKA21"
+    secret_message = "Xin chao Taka27"
 
     # Embed the secret message into the cover audio
-    embed_audio(stego_audio_path, secret_message, cover_audio_path)
+    embed_message(stego_audio_path, secret_message, cover_audio_path)
 
-    print("Extracted message: ", extract_audio(stego_audio_path))
+    print("Extracted message:", extract_message(stego_audio_path))
