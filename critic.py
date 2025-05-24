@@ -1,5 +1,6 @@
 import torch
 from torch import nn
+import torch.nn.functional as F
 
 
 class BasicCritic(nn.Module):
@@ -76,3 +77,7 @@ class BasicCritic(nn.Module):
         x_2 = self._models[2](x_1)
         x_3 = self._models[3](x_2)
         return torch.mean(x_3.view(x_3.size(0), -1), dim=1)
+
+class ImprovedCritic(BasicCritic):
+    def _name(self):
+        return "ImprovedCritic"

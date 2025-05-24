@@ -21,9 +21,8 @@ class BasicDecoder(nn.Module):
         )
 
     def _build_models(self):
-        # First layer: Process STFT input
         self.conv1 = nn.Sequential(
-            self._conv2d(self.channels_size, self.hidden_size),  # Changed from 3 to 2 channels
+            self._conv2d(self.channels_size, self.hidden_size),
             nn.LeakyReLU(inplace=True),
             nn.BatchNorm2d(self.hidden_size),
         )
@@ -93,4 +92,40 @@ class DenseDecoder(BasicDecoder):
         x_list.append(x_2)
         x_3 = self._models[3](torch.cat(x_list, dim=1))
         x_list.append(x_3)
+        return x_3
+
+class ImprovedDecoder(DenseDecoder):
+    def _name(self):
+        return "ImprovedDecoder"
+
+    def _build_models(self):
+        models = super()._build_models()
+
+        self.lstm = nn.LSTM(
+            input_size=self.hidden_size,
+            hidden_size=self.hidden_size,
+            num_layers=1,
+            batch_first=True
+        )
+
+        return models
+
+    def forward(self, image):
+        x = self._models[0](image)
+
+        # Process through LSTM
+        B, C, H, W = x.shape
+        x_lstm = x.permute(0, 2, 3, 1)  # [B, H, W, C]
+        x_lstm = x_lstm.reshape(B*H, W, C)  # [B*H, W, C]
+        x_lstm, _ = self.lstm(x_lstm)
+        x = x_lstm.reshape(B, H, W, C).permute(0, 3, 1, 2)  # Back to [B, C, H, W]
+        x_list = [x]
+
+        x_1 = self._models[1](torch.cat(x_list, dim=1))
+        x_list.append(x_1)
+
+        x_2 = self._models[2](torch.cat(x_list, dim=1))
+        x_list.append(x_2)
+
+        x_3 = self._models[3](torch.cat(x_list, dim=1))
         return x_3

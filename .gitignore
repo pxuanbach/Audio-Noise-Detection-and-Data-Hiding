@@ -183,3 +183,4 @@ datasets/processed/
 
 node_modules/
 jspm_packages/
+.next

@@ -13,9 +13,9 @@ import gc
 from torchvision import transforms
 # from datasets.audio_dataset import AudioDataset
 from datasets import AudioToImageFolder
-from encoder import DenseEncoder
-from decoder import DenseDecoder
-from critic import BasicCritic
+from encoder import DenseEncoder, ImprovedEncoder
+from decoder import DenseDecoder, ImprovedDecoder
+from critic import BasicCritic, ImprovedCritic
 from utils import ssim
 from utils.audio_to_stft import audio_to_stft
 
@@ -300,7 +300,7 @@ def fit_gan(encoder, decoder, critic, en_de_optimizer, cr_optimizer, metrics, tr
 
 if __name__ == '__main__':
     config = {
-        'batch_size': 8,
+        'batch_size': 4,
         'epochs': 32,
         'learning_rate': 0.0005,
         'channels_size': 2,
@@ -317,9 +317,12 @@ if __name__ == '__main__':
 
     device = torch.device('cuda' if torch.cuda.is_available() else 'cpu')
 
-    encoder = DenseEncoder(data_depth, hidden_size, channels_size).to(device)
-    decoder = DenseDecoder(data_depth, hidden_size, channels_size).to(device)
-    critic = BasicCritic(hidden_size, channels_size).to(device)
+    # encoder = DenseEncoder(data_depth, hidden_size, channels_size).to(device)
+    encoder = ImprovedEncoder(data_depth, hidden_size, channels_size).to(device)
+    # decoder = DenseDecoder(data_depth, hidden_size, channels_size).to(device)
+    decoder = ImprovedDecoder(data_depth, hidden_size, channels_size).to(device)
+    # critic = BasicCritic(hidden_size, channels_size).to(device)
+    critic = ImprovedCritic(hidden_size, channels_size).to(device)
 
     # Optimizers
     cr_optimizer = Adam(critic.parameters(), lr=learning_rate)
@@ -341,7 +344,7 @@ if __name__ == '__main__':
 
     #region new dataset machanism
     data_dir="D:/Backup/FSDKaggle2018"
-    transform = transforms.Compose([transforms.Lambda(lambda wav: audio_to_stft(wav))])
+    transform = transforms.Compose([transforms.Lambda(lambda wav: audio_to_stft(wav, 320))])
     train_set = AudioToImageFolder(data_dir, transform=transform)
     part_train_set = torch.utils.data.random_split(train_set, [1000, len(train_set)-1000])[0]
     train_loader = torch.utils.data.DataLoader(part_train_set, batch_size=batch_size, shuffle=True,)
