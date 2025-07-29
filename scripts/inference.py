@@ -188,8 +188,9 @@ def make_message(image, decoder=None, device='cuda'):
     image = image.to(device)
 
     image = decoder(image).view(-1) > 0
-    image = torch.tensor(image, dtype=torch.uint8)
-
+    # image = torch.tensor(image, dtype=torch.uint8)
+    image = image.clone().detach().to(dtype=torch.uint8)
+    
     # split and decode messages
     candidates = Counter()
     bits = image.data.cpu().numpy().tolist()

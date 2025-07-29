@@ -3,6 +3,9 @@ import numpy as np
 import skimage
 import soundfile as sf
 import torch
+import skimage.transform
+import torchaudio
+
 from .chaotic_sequence import get_segment_positions
 
 
@@ -87,30 +90,94 @@ def compute_hop_length(segment_len, n_fft, target_frames):
 
 
 def audio_to_stft(audio_wav, target_frames=360):
-    audio_wav = audio_wav[0]
-    audio_length = audio_wav.shape[0]
+    if audio_wav.dim() > 1:
+        audio_wav = audio_wav[0]
+    
+    audio_tensor = audio_wav.to(dtype=torch.float32)
+    device = audio_tensor.device
+
+    audio_length = audio_tensor.shape[0]
     hop_length = int(audio_length / (target_frames - 1))
     n_fft = int((target_frames - 1) * 2)
 
-    mel_spectrogram = librosa.stft(
-        np.asanyarray(audio_wav),
+    # Use Hann window to match librosa.stft
+    window = torch.hann_window(n_fft, device=device)
+
+    # Pad the signal to match librosa's center=True
+    stft_transform = torch.stft(
+        audio_tensor,
         n_fft=n_fft,
-        hop_length=hop_length
+        hop_length=hop_length,
+        window=window,
+        center=True,  # Match librosa default
+        pad_mode='reflect',  # Match librosa padding
+        return_complex=True
     )
 
-    mel_real = np.real(mel_spectrogram)
-    mel_imag = np.imag(mel_spectrogram)
+    # Normalize to match librosa (approximate scaling)
+    # librosa divides by sqrt(sum(window^2)) for energy normalization
+    window_sum = torch.sqrt(torch.sum(window ** 2))
+    stft_transform = stft_transform / window_sum
+
+    mel_real = stft_transform.real
+    mel_imag = stft_transform.imag
 
     if mel_real.shape != (target_frames, target_frames):
+        mel_real_np = mel_real.cpu().numpy()
+        mel_real_np = skimage.transform.resize(
+            mel_real_np,
+            output_shape=(target_frames, target_frames),
+            order=1
+        )
+        mel_real = torch.tensor(mel_real_np, dtype=torch.float32, device=device)
+
+    if mel_imag.shape != (target_frames, target_frames):
+        mel_imag_np = mel_imag.cpu().numpy()
+        mel_imag_np = skimage.transform.resize(
+            mel_imag_np,
+            output_shape=(target_frames, target_frames),
+            order=1
+        )
+        mel_imag = torch.tensor(mel_imag_np, dtype=torch.float32, device=device)
+
+    output = torch.stack([mel_real, mel_imag])
+
+    return output, hop_length, n_fft
+
+def audio_to_stft_alt(audio_wav, target_frames=360):
+    audio_wav = audio_wav[0]
+    audio_tensor = torch.tensor(audio_wav, dtype=torch.float32)
+
+    audio_length = audio_tensor.shape[0]
+    hop_length = int(audio_length / (target_frames - 1))
+    n_fft = int((target_frames - 1) * 2)
+
+    # Thực hiện STFT bằng torchaudio
+    stft_result = torch.stft(
+        audio_tensor,
+        n_fft=n_fft,
+        hop_length=hop_length,
+        return_complex=True
+    )
+
+    # Chuyển sang numpy để resize bằng skimage
+    stft_numpy = stft_result.cpu().detach().numpy()
+
+    # Lấy real và imag
+    mel_real = np.real(stft_numpy)
+    mel_imag = np.imag(stft_numpy)
+
+    # Resize nếu cần
+    if mel_real.shape != (target_frames, target_frames):
         mel_real = skimage.transform.resize(
-            image=mel_real,
+            mel_real,
             output_shape=(target_frames, target_frames),
             order=1
         )
 
     if mel_imag.shape != (target_frames, target_frames):
         mel_imag = skimage.transform.resize(
-            image=mel_imag,
+            mel_imag,
             output_shape=(target_frames, target_frames),
             order=1
         )
